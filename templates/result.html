@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Poll Results</title>
+</head>
+<body>
+    <h1>Results</h1>
+    <ul>
+        {% for option, count in votes.items() %}
+        <li>{{ option }}: {{ count }} votes</li>
+        {% endfor %}
+    </ul>
+    <a href="{{ url_for('index') }}">Back to poll</a>
+</body>
+</html>

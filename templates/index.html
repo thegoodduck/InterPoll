@@ -1,0 +1,11 @@
+<h1>{{ question }}</h1>
+<form method="POST">
+    {% for option in options %}
+    <input type="radio" name="vote" value="{{ option }}" required> {{ option }}<br>
+    {% endfor %}
+    <label>Bitcoin Address:</label><br>
+    <input type="text" name="address" required><br><br>
+    <label>Signature (sign message with wallet):</label><br>
+    <input type="text" name="signature" required><br><br>
+    <button type="submit">Vote</button>
+</form>
