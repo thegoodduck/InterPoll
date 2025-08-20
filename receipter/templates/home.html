@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>InterPoll Receipter</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; margin: 2rem; }
+    .card { max-width: 860px; padding: 1.5rem; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 1rem; padding: 0.4rem 0; border-bottom: 1px dashed #e5e7eb; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Receipter</h1>
+    <p>Stored receipts: <strong>{{ count }}</strong></p>
+    <p>To add a receipt, the main app will POST JSON to <code>/ingest</code>. You can also paste JSON below:</p>
+    <textarea id="txt" rows="8" style="width:100%;"></textarea>
+    <p><button onclick="submitJson()">Submit JSON</button></p>
+    <h3>Recent</h3>
+    {% for r in receipts %}
+      <div class="row">
+        <div>
+          <div>Poll: <code>{{ r.poll_id }}</code></div>
+          <div>Entry: <code>{{ r.entry_hash }}</code></div>
+          <div>Index: <code>{{ r.index }}</code></div>
+          <div>Head: <code>{{ r.chain_head }}</code></div>
+          <div>Time: <code>{{ r.timestamp }}</code> (recv: <code>{{ r.received_at }}</code>)</div>
+        </div>
+  <div><button data-json='{{ r | tojson | e }}' onclick='copyBtn(this)'>Copy</button></div>
+      </div>
+    {% endfor %}
+  </div>
+  <script>
+    async function submitJson(){
+      try {
+        const parsed = JSON.parse(document.getElementById('txt').value)
+        const res = await fetch('/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(parsed) })
+        if(!res.ok) throw new Error('HTTP ' + res.status)
+        location.reload()
+      } catch(e) {
+        alert('Invalid JSON or error submitting')
+      }
+    }
+    function copyBtn(btn){
+      try {
+        const obj = JSON.parse(btn.getAttribute('data-json'))
+        navigator.clipboard.writeText(JSON.stringify(obj, null, 2))
+      } catch(e) { alert('Failed to copy') }
+    }
+    // Auto-ingest receipt from URL hash: #r=<base64json>
+    (async function(){
+      const hash = location.hash || ''
+      const m = hash.match(/[#&]r=([^&]+)/)
+      if (!m) return
+      try {
+        const jsonStr = atob(decodeURIComponent(m[1]))
+        const payload = JSON.parse(jsonStr)
+        const res = await fetch('/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        if (res.ok) {
+          // remove hash to prevent re-post on refresh
+          history.replaceState(null, '', location.pathname)
+          location.reload()
+        }
+      } catch(e) {
+        console.warn('Auto-ingest failed', e)
+      }
+    })()
+  </script>
+</body>
+</html>
