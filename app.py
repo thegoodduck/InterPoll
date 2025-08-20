@@ -1,15 +1,18 @@
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, render_template, request, redirect, url_for, make_response
 import os
 import subprocess
 import hashlib
 from datetime import datetime, timezone
 import json
-from bitcoinlib.keys import Address
+import logging
 
 app = Flask(__name__)
 VOTE_DIR = "votes"
 DB_FILE = "votes_db.json"
 os.makedirs(VOTE_DIR, exist_ok=True)
+
+# Secret key for sessions/cookies (override in env for production)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 # Define your poll
 POLL_ID = "poll_001"
@@ -31,41 +34,37 @@ def hash_vote(vote_text):
     return hashlib.sha256(vote_text.encode()).hexdigest()
 
 def timestamp_vote(file_path):
-    subprocess.run(["ots", "stamp", file_path], check=True)
-
-def verify_signature(address, message, signature):
     """
-    Verify Bitcoin message signature.
+    Attempt to timestamp the file using OpenTimestamps CLI if available.
+    Fails gracefully if CLI is missing or command fails.
     """
     try:
-        addr = Address.import_address(address)
-        return addr.verify(message, signature)
-    except Exception:
-        return False
+        subprocess.run(["ots", "stamp", file_path], check=True)
+    except FileNotFoundError:
+        logging.warning("OpenTimestamps CLI 'ots' not found. Skipping timestamp.")
+    except subprocess.CalledProcessError as e:
+        logging.warning("OpenTimestamps failed: %s", e)
+
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        address = request.form.get("address").strip()
-        signature = request.form.get("signature").strip()
-        vote = request.form.get("vote").strip()
+        vote = (request.form.get("vote") or "").strip()
 
         if vote not in POLL_OPTIONS:
             return "Invalid vote option!", 400
 
-        # Prevent double voting
-        if address in votes_db["votes"]:
-            return "This Bitcoin address has already voted!", 403
-
-        # Build message
-        message = f"{POLL_ID}|{vote}"
-        if not verify_signature(address, message, signature):
-            return "Invalid signature!", 400
+        # Prevent double voting (MVP): simple cookie-based check
+        voted_cookie_key = f"voted_{POLL_ID}"
+        if request.cookies.get(voted_cookie_key):
+            return redirect(url_for("results"))
 
         # Save vote with timestamp
         timestamp = datetime.now(timezone.utc).isoformat()
-        vote_data = f"{vote}|{address}|{timestamp}"
-        file_name = f"{VOTE_DIR}/{hash_vote(vote_data)}.txt"
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        vote_data = f"{vote}|{timestamp}|{client_ip}"
+        file_hash = hash_vote(vote_data)
+        file_name = f"{VOTE_DIR}/{file_hash}.txt"
 
         with open(file_name, "w") as f:
             f.write(vote_data)
@@ -73,13 +72,19 @@ def index():
         timestamp_vote(file_name)
 
         # Record in DB
-        votes_db["votes"][address] = {"choice": vote, "timestamp": timestamp}
+        votes_db["votes"][file_hash] = {"choice": vote, "timestamp": timestamp, "ip": client_ip}
         votes_db["counts"][vote] += 1
         save_db()
 
-        return redirect(url_for("results"))
+        # Set cookie to block repeat voting from the same browser
+        resp = make_response(redirect(url_for("results")))
+        # 30 days expiry
+        resp.set_cookie(voted_cookie_key, "1", max_age=30 * 24 * 3600, samesite="Lax")
+        return resp
 
-    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS)
+    # GET
+    voted = request.cookies.get(f"voted_{POLL_ID}") is not None
+    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS, voted=voted)
 
 @app.route("/results")
 def results():

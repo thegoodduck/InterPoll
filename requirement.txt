@@ -1,3 +1,2 @@
 Flask
-pyOpenSSL
 opentimestamps-client

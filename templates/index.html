@@ -1,11 +1,57 @@
-<h1>{{ question }}</h1>
-<form method="POST">
-    {% for option in options %}
-    <input type="radio" name="vote" value="{{ option }}" required> {{ option }}<br>
-    {% endfor %}
-    <label>Bitcoin Address:</label><br>
-    <input type="text" name="address" required><br><br>
-    <label>Signature (sign message with wallet):</label><br>
-    <input type="text" name="signature" required><br><br>
-    <button type="submit">Vote</button>
-</form>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>InterPoll</title>
+    <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 2rem; }
+        .card { max-width: 560px; padding: 1.5rem; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        h1 { margin-top: 0; }
+        .option { margin: 0.5rem 0; }
+        .actions { margin-top: 1rem; }
+        button { padding: 0.6rem 1rem; border-radius: 8px; border: 1px solid #2563eb; background: #2563eb; color: white; cursor: pointer; }
+        button:disabled { background: #9ca3af; border-color: #9ca3af; cursor: not-allowed; }
+        .note { color: #6b7280; font-size: 0.9rem; }
+        .success { color: #059669; }
+        a { color: #2563eb; text-decoration: none; }
+    </style>
+    <script>
+        function onSubmit(e){
+            const btn = document.getElementById('voteBtn');
+            btn.disabled = true; btn.textContent = 'Submitting…';
+        }
+    </script>
+    <script>
+        // Basic client-side guard to discourage quick revotes in same tab
+        document.addEventListener('DOMContentLoaded', () => {
+            const voted = document.body.dataset.voted === 'true';
+            if (voted) {
+                const btn = document.getElementById('voteBtn');
+                if (btn) btn.disabled = true;
+            }
+        });
+    </script>
+    </head>
+<body data-voted="{{ 'true' if voted else 'false' }}">
+    <div class="card">
+        <h1>{{ question }}</h1>
+        {% if voted %}
+            <p class="success">Thanks, your vote was recorded. You can see live results below.</p>
+        {% else %}
+        <form method="POST" onsubmit="onSubmit(event)">
+            {% for option in options %}
+            <label class="option">
+                <input type="radio" name="vote" value="{{ option }}" required> {{ option }}
+            </label><br>
+            {% endfor %}
+            <div class="actions">
+                <button id="voteBtn" type="submit">Vote</button>
+            </div>
+            <p class="note">No wallet or crypto setup needed. One vote per browser for this MVP.</p>
+        </form>
+        {% endif %}
+        <p><a href="{{ url_for('results') }}">See results</a></p>
+    </div>
+</body>
+</html>
