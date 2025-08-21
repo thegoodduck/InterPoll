@@ -1,0 +1,11 @@
+[
+  {
+    "poll_id": "poll_001",
+    "entry_hash": "902e7dbafa36cc2a696e0fcf7e781b61ea5fa4347915c3e358a9f4f59ec28ec8",
+    "index": 4,
+    "chain_head": "a2a1db227237ba3a868113dadddf248f9eae5328e16b41008b2fca7d3f095e32",
+    "timestamp": "2025-08-21T23:21:52.643913+00:00",
+    "file_id": "92a96e8183f7c663628c6da0c3b45712f2e077cab4bb6e1fb2f369a665c2b467",
+    "received_at": "2025-08-21T23:22:01.092633+00:00"
+  }
+]
