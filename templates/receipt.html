@@ -53,12 +53,16 @@
             const receipterUrl = '{{ receipter_url }}';
             if (!receipterUrl) { alert('Receipter URL not configured.'); return; }
             const r = makeReceipt();
+            const status = document.getElementById('receipterStatus');
+            if (status) { status.textContent = 'Sending receipt to Receipter…'; status.style.color = '#6b7280'; }
             try {
                 const res = await fetch(receipterUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) });
                 if (!res.ok) throw new Error('Failed: ' + res.status);
-                alert('Receipt sent to Receipter.');
+                let body = {};
+                try { body = await res.json(); } catch(e) {}
+                if (status) { status.textContent = body.verified ? 'Receipt stored & VERIFIED on Receipter.' : 'Receipt stored (not yet verified).'; status.style.color = body.verified ? '#059669' : '#d97706'; }
             } catch (e) {
-                alert('Could not send receipt automatically. You can download it and upload later.');
+                if (status) { status.textContent = 'Auto send failed: ' + e.message + ' (You can manually download & upload later)'; status.style.color = '#dc2626'; }
             }
         }
 
@@ -69,6 +73,12 @@
             const encoded = encodeURIComponent(btoa(JSON.stringify(r)));
             window.open(page + '#r=' + encoded, '_blank');
         }
+        // Auto attempt to send to Receipter on load (non-blocking)
+        document.addEventListener('DOMContentLoaded', () => {
+            if (document.getElementById('autoSendToggle')?.checked) {
+                sendToReceipter();
+            }
+        });
     </script>
 </head>
 <body>
@@ -85,7 +95,11 @@
             <button onclick="downloadReceipt()">Download JSON</button>
             <button onclick="sendToReceipter()">Send to Receipter</button>
             <button onclick="openReceipterWithHash()">Open Receipter (auto-import)</button>
+            <label style="margin-left:0.5rem;font-size:0.85rem;">
+                <input type="checkbox" id="autoSendToggle" checked> auto-send
+            </label>
         </p>
+        <div id="receipterStatus" style="font-size:0.9rem;margin-top:0.25rem;color:#6b7280;">Auto-sending…</div>
 
         <h3>Verify</h3>
         <ol>

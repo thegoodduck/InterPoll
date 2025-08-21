@@ -1,2 +1,3 @@
 Flask
 opentimestamps-client
+authlib

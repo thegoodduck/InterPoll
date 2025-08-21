@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, make_response, send_file, abort
+from flask import Flask, render_template, request, redirect, url_for, make_response, send_file, abort, session
 import os
 import subprocess
 import hashlib
@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import json
 import logging
 from collections import Counter
+
+from authlib.integrations.flask_client import OAuth
 
 app = Flask(__name__)
 VOTE_DIR = "votes"
@@ -21,6 +23,31 @@ app.config["RECEIPTER_PAGE_URL"] = os.environ.get("RECEIPTER_PAGE_URL", "http://
 LOG_FILE = "votes_log.jsonl"  # append-only JSON Lines
 LOG_STATE = "log_state.json"  # stores chain head and count
 CHAIN_HEAD_FILE = "chain_head.txt"  # contains latest chain head info for OTS
+
+oauth = OAuth(app)
+
+# Register OAuth providers conditionally (Google, GitHub). Apple requires extra keys (TODO).
+if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
+    oauth.register(
+        name="google",
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"}
+    )
+
+if os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET"):
+    oauth.register(
+        name="github",
+        client_id=os.getenv("GITHUB_CLIENT_ID"),
+        client_secret=os.getenv("GITHUB_CLIENT_SECRET"),
+        access_token_url="https://github.com/login/oauth/access_token",
+        authorize_url="https://github.com/login/oauth/authorize",
+        api_base_url="https://api.github.com/",
+        client_kwargs={"scope": "read:user user:email"}
+    )
+
+# Apple placeholder (Sign in with Apple requires generating a client secret JWT). Left as future work.
 
 # Define your poll
 POLL_ID = "poll_001"
@@ -208,7 +235,14 @@ def index():
 
         timestamp = datetime.now(timezone.utc).isoformat()
         client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-        vote_data = f"{vote}|{timestamp}|{client_ip}"
+        user_agent = request.headers.get("User-Agent", "")[:400]
+        # Include a user identity if logged in
+        user = session.get("user") or {}
+        user_id = user.get("sub") or user.get("id")
+        provider = user.get("_provider") if user else None
+        identity = f"{provider}:{user_id}" if provider and user_id else ""
+
+        vote_data = f"{vote}|{timestamp}|{client_ip}|{user_agent}|{identity}"
         file_hash = hash_vote(vote_data)
         file_name = f"{VOTE_DIR}/{file_hash}.txt"
 
@@ -222,7 +256,7 @@ def index():
 
         timestamp_vote(file_name)
 
-        votes_db["votes"][file_hash] = {"choice": vote, "timestamp": timestamp, "ip": client_ip}
+        votes_db["votes"][file_hash] = {"choice": vote, "timestamp": timestamp, "ip": client_ip, "ua": user_agent, "identity": identity}
         votes_db["counts"][vote] += 1
         save_db()
 
@@ -232,6 +266,8 @@ def index():
             "timestamp": timestamp,
             "id": file_hash,
             "ip": client_ip,
+            "ua": user_agent,
+            "identity": identity,
             "file_hash": file_hash,
             "filename": f"{file_hash}.txt"
         }
@@ -244,7 +280,8 @@ def index():
 
     # GET branch
     voted = request.cookies.get(f"voted_{POLL_ID}") is not None
-    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS, voted=voted)
+    user = session.get("user")
+    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS, voted=voted, user=user)
 
 @app.route("/results")
 def results():
@@ -294,6 +331,51 @@ def download_chain_head():
     if not os.path.exists(CHAIN_HEAD_FILE):
         return abort(404)
     return send_file(CHAIN_HEAD_FILE, mimetype="text/plain", as_attachment=True, download_name="chain_head.txt")
+
+
+# -------- Authentication Routes --------
+@app.route("/login/<provider>")
+def oauth_login(provider):
+    client = oauth.create_client(provider)
+    if not client:
+        return f"Provider '{provider}' not configured", 404
+    redirect_uri = url_for("oauth_callback", provider=provider, _external=True)
+    return client.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/callback/<provider>")
+def oauth_callback(provider):
+    client = oauth.create_client(provider)
+    if not client:
+        return f"Provider '{provider}' not configured", 404
+    token = client.authorize_access_token()
+    userinfo = {}
+    if provider == "google":
+        userinfo = token.get("userinfo") or client.userinfo()  # OIDC userinfo
+        if not userinfo:
+            # Fallback to id_token claims
+            userinfo = {
+                "sub": token.get("id_token_sub") or token.get("sub"),
+                "email": token.get("email"),
+                "name": token.get("name")
+            }
+    elif provider == "github":
+        # Fetch primary user profile
+        resp = client.get("user")
+        if resp.ok:
+            data = resp.json()
+            userinfo = {"id": data.get("id"), "login": data.get("login"), "name": data.get("name"), "email": data.get("email")}
+    else:
+        userinfo = {"sub": "unknown"}
+    userinfo["_provider"] = provider
+    session["user"] = userinfo
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    return redirect(url_for("index"))
 
 if __name__ == "__main__":
     app.run(debug=True)
