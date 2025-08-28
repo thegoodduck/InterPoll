@@ -41,7 +41,7 @@
             {% if user.email %}{{ user.email }}{% elif user.login %}{{ user.login }}{% elif user.name %}{{ user.name }}{% else %}user{% endif %}
             ({{ user._provider }}) · <a href="{{ url_for('logout') }}">Logout</a></p>
         {% else %}
-            <p style="font-size:0.85rem;color:#374151;">Optional: <a href="{{ url_for('oauth_login', provider='google') }}">Google</a> | <a href="{{ url_for('oauth_login', provider='github') }}">GitHub</a></p>
+            <p style="font-size:0.85rem;color:#374151;">Optional: <a href="{{ url_for('login_google') }}">Google</a> | <a href="{{ url_for('login_github') }}">GitHub</a></p>
         {% endif %}
         {% if voted %}
             <p class="success">Thanks, your vote was recorded. You can see live results below.</p>

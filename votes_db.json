@@ -14,10 +14,17 @@
       "choice": "Yes",
       "timestamp": "2025-08-21T23:46:28.690418+00:00",
       "ip": "127.0.0.1"
+    },
+    "b8da34c604075d9862543265a5b6f7da0b6e33424e6c8c0ff1b25504672cf7ad": {
+      "choice": "Yes",
+      "timestamp": "2025-08-28T22:23:44.974791+00:00",
+      "ip": "127.0.0.1",
+      "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+      "identity": ""
     }
   },
   "counts": {
-    "Yes": 2,
+    "Yes": 3,
     "No": 0,
     "Maybe": 1
   }

@@ -28,5 +28,15 @@
     "file_id": "91bf863e3550bcd92ccf3d1bdd3a1291f51c4939fa261b4f3544113e0d6a9001",
     "received_at": "2025-08-21T23:46:32.097683+00:00",
     "verified": true
+  },
+  {
+    "poll_id": "poll_001",
+    "entry_hash": "bfca7aed83dc8bd2cc7b51eddedad4d27f197686624de8c78c9176599b6a1bbe",
+    "index": 3,
+    "chain_head": "50cf6aaf50b106d5f2eebafa926a207ab5cf283d10655033decd6ca020b062ab",
+    "timestamp": "2025-08-28T22:23:44.974791+00:00",
+    "file_id": "b8da34c604075d9862543265a5b6f7da0b6e33424e6c8c0ff1b25504672cf7ad",
+    "received_at": "2025-08-28T22:27:38.711180+00:00",
+    "verified": true
   }
 ]
