@@ -7,7 +7,6 @@ import logging
 from collections import Counter
 from flask import Flask, render_template, request, redirect, url_for, make_response, send_file, abort, session
 from authlib.integrations.flask_client import OAuth
-from dotenv import load_dotenv
 
 # --- File/dir constants ---
 VOTE_DIR = "votes"
@@ -16,40 +15,28 @@ LOG_FILE = "votes_log.jsonl"
 LOG_STATE = "log_state.json"
 CHAIN_HEAD_FILE = "chain_head.txt"
 
-load_dotenv()  # Load variables from .env if present
-
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
+app.secret_key = "supersecret"  # Hardcoded for Option A (replace for production)
 oauth = OAuth(app)
 
-# --- OAuth Provider Registration (environment-driven) ---
-google_client_id = os.getenv("GOOGLE_CLIENT_ID")
-google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-if google_client_id and google_client_secret:
-    oauth.register(
-        name='google',
-        client_id=google_client_id,
-        client_secret=google_client_secret,
-        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-        client_kwargs={'scope': 'openid email profile'}
-    )
-else:
-    logging.warning("Google OAuth not configured (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET).")
+# --- OAuth Provider Registration (Hardcoded - Option A) ---
+oauth.register(
+    name='google',
+    client_id='478090540512-rtc3help4la8vj941ucrsodn4e5h0fm8.apps.googleusercontent.com',
+    client_secret='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',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
 
-github_client_id = os.getenv("GITHUB_CLIENT_ID")
-github_client_secret = os.getenv("GITHUB_CLIENT_SECRET")
-if github_client_id and github_client_secret:
-    oauth.register(
-        name='github',
-        client_id=github_client_id,
-        client_secret=github_client_secret,
-        access_token_url='https://github.com/login/oauth/access_token',
-        authorize_url='https://github.com/login/oauth/authorize',
-        api_base_url='https://api.github.com/',
-        client_kwargs={'scope': 'read:user user:email'}
-    )
-else:
-    logging.warning("GitHub OAuth not configured (set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET).")
+oauth.register(
+    name='github',
+    client_id='Iv1.1234567890abcdef',  # replace with actual GitHub client ID
+    client_secret='abcdef1234567890abcdef1234567890abcdef12',  # replace with actual GitHub client secret
+    access_token_url='https://github.com/login/oauth/access_token',
+    authorize_url='https://github.com/login/oauth/authorize',
+    api_base_url='https://api.github.com/',
+    client_kwargs={'scope': 'read:user user:email'}
+)
 
 # --- Poll Setup ---
 POLL_ID = "poll_001"
@@ -258,4 +245,5 @@ def receipt():
     return render_template("receipt.html", entry_hash=entry_hash, index=idx, head=state.get("head"), poll_id=POLL_ID)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # use_reloader=False helps prevent session/state loss between processes during OAuth callback
+    app.run(debug=True, use_reloader=False)
