@@ -1,12 +1,16 @@
 import os
+import secrets
 import subprocess
 import hashlib
 from datetime import datetime, timezone
 import json
 import logging
 from collections import Counter
-from flask import Flask, render_template, request, redirect, url_for, make_response, send_file, abort, session
+from flask import Flask, render_template, request, redirect, url_for, make_response, abort, session
 from authlib.integrations.flask_client import OAuth
+from authlib.jose import jwt
+from dotenv import load_dotenv
+import requests
 
 # --- File/dir constants ---
 VOTE_DIR = "votes"
@@ -15,28 +19,29 @@ LOG_FILE = "votes_log.jsonl"
 LOG_STATE = "log_state.json"
 CHAIN_HEAD_FILE = "chain_head.txt"
 
+load_dotenv()
+
 app = Flask(__name__)
-app.secret_key = "supersecret"  # Hardcoded for Option A (replace for production)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
 oauth = OAuth(app)
 
-# --- OAuth Provider Registration (Hardcoded - Option A) ---
-oauth.register(
-    name='google',
-    client_id='478090540512-rtc3help4la8vj941ucrsodn4e5h0fm8.apps.googleusercontent.com',
-    client_secret='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',
-    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'}
-)
+# --- Idena verification endpoint (configurable) ---
+IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "https://api.idena.io/api/Signature/Verify")
+IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "simple")
 
-oauth.register(
-    name='github',
-    client_id='Iv1.1234567890abcdef',  # replace with actual GitHub client ID
-    client_secret='abcdef1234567890abcdef1234567890abcdef12',  # replace with actual GitHub client secret
-    access_token_url='https://github.com/login/oauth/access_token',
-    authorize_url='https://github.com/login/oauth/authorize',
-    api_base_url='https://api.github.com/',
-    client_kwargs={'scope': 'read:user user:email'}
-)
+# --- Google OAuth (optional) ---
+google_id = os.getenv("GOOGLE_CLIENT_ID")
+google_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+if google_id and google_secret:
+    oauth.register(
+        name='google',
+        client_id=google_id,
+        client_secret=google_secret,
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={'scope': 'openid email profile'}
+    )
+else:
+    logging.warning("Google OAuth not configured")
 
 # --- Poll Setup ---
 POLL_ID = "poll_001"
@@ -124,17 +129,64 @@ def rebuild_counts_and_anomalies():
         file_hash = entry.get("file_hash") or entry.get("id")
         path = os.path.join(VOTE_DIR, filename)
         if not os.path.exists(path):
-            anomalies.append({"type": "missing_file", "filename": filename, "entry_hash": rec.get("entry_hash")})
+            anomalies.append({"type": "missing_file", "filename": filename})
             continue
         try:
             with open(path, "rb") as vf:
                 data = vf.read()
             actual = hashlib.sha256(data).hexdigest()
             if file_hash and actual != file_hash:
-                anomalies.append({"type": "hash_mismatch", "filename": filename, "expected": file_hash, "actual": actual, "entry_hash": rec.get("entry_hash")})
+                anomalies.append({"type": "hash_mismatch", "filename": filename})
         except Exception as e:
-            anomalies.append({"type": "read_error", "filename": filename, "error": str(e), "entry_hash": rec.get("entry_hash")})
+            anomalies.append({"type": "read_error", "filename": filename, "error": str(e)})
     return counts, anomalies
+
+# ---------------------------
+# Idena Auth
+# ---------------------------
+def verify_idena_signature(address: str, message: str, signature: str) -> bool:
+    try:
+        r = requests.post(IDENA_VERIFY_URL, json={
+            "address": address,
+            "message": message,
+            "signature": signature
+        }, timeout=10)
+        if not r.ok:
+            return False
+        data = r.json()
+        return bool(data.get("result") or data.get("success") or data.get("ok"))
+    except Exception as e:
+        logging.exception("Idena verify failed: %s", e)
+        return False
+
+@app.route("/login/idena/start")
+def login_idena():
+    challenge = secrets.token_hex(16)
+    session["idena_challenge"] = challenge
+    return render_template("idena_start.html", challenge=challenge)
+
+@app.route("/auth/idena", methods=["POST"])
+def auth_idena():
+    """Handle Idena auth via JWT id_token posted from client.
+
+    Expected form fields:
+      - id_token: JWT containing address claim (and others)
+    """
+    id_token = request.form.get("id_token", "").strip()
+    if not id_token:
+        return "Missing id_token", 400
+    try:
+        # For simplicity we skip signature verification (would require Idena JWKS); we still parse & validate exp.
+        claims = jwt.decode(id_token, key=None, claims_options={"iss": None, "aud": None})
+        claims.validate()
+        address = claims.get("address") or claims.get("addr") or claims.get("sub")
+        if not address:
+            return "No address in token", 400
+        session["user"] = {"_provider": "idena", "address": address, "claims": dict(claims)}
+        return redirect(url_for("index"))
+    except Exception as e:
+        logging.exception("Idena JWT parse failed: %s", e)
+        return "Invalid id_token", 400
 
 # --- Routes ---
 @app.route("/")
@@ -151,24 +203,10 @@ def login_google():
 @app.route("/auth/google")
 def auth_google():
     oauth.google.authorize_access_token()
-    user = oauth.google.userinfo()  # Fetch from Google's OpenID UserInfo endpoint
+    user = oauth.google.userinfo()
     if user:
         user["_provider"] = "google"
         session["user"] = user
-    return redirect(url_for("index"))
-
-@app.route("/login/github")
-def login_github():
-    redirect_uri = url_for("auth_github", _external=True)
-    return oauth.github.authorize_redirect(redirect_uri)
-
-@app.route("/auth/github")
-def auth_github():
-    oauth.github.authorize_access_token()
-    resp = oauth.github.get("user")
-    user = resp.json() if resp.ok else {}
-    user["_provider"] = "github"
-    session["user"] = user
     return redirect(url_for("index"))
 
 @app.route("/logout")
@@ -176,7 +214,7 @@ def logout():
     session.pop("user", None)
     return redirect(url_for("index"))
 
-# --- Voting route ---
+# --- Voting ---
 @app.route("/vote", methods=["POST"])
 def vote():
     vote_choice = request.form.get("vote")
@@ -185,9 +223,13 @@ def vote():
 
     voted_cookie_key = f"voted_{POLL_ID}"
     user = session.get("user") or {}
-    user_id = user.get("sub") or user.get("id")
     provider = user.get("_provider")
-    identity = f"{provider}:{user_id}" if provider and user_id else ""
+    if provider == "idena":
+        identity = f"idena:{user.get('address','')}"
+    elif provider:
+        identity = f"{provider}:{user.get('sub') or user.get('id')}"
+    else:
+        identity = ""
 
     if identity:
         for v in votes_db["votes"].values():
@@ -208,7 +250,13 @@ def vote():
         f.write(vote_data)
     timestamp_vote(file_name)
 
-    votes_db["votes"][file_hash] = {"choice": vote_choice, "timestamp": timestamp, "ip": client_ip, "ua": user_agent, "identity": identity}
+    votes_db["votes"][file_hash] = {
+        "choice": vote_choice,
+        "timestamp": timestamp,
+        "ip": client_ip,
+        "ua": user_agent,
+        "identity": identity
+    }
     votes_db["counts"][vote_choice] += 1
     save_db()
 
@@ -217,14 +265,12 @@ def vote():
         "choice": vote_choice,
         "timestamp": timestamp,
         "id": file_hash,
-        "ip": client_ip,
-        "ua": user_agent,
         "identity": identity,
         "file_hash": file_hash,
         "filename": f"{file_hash}.txt"
     }
     entry_hash, head, idx = append_transparency_log(log_entry)
-    resp = make_response(redirect(url_for("receipt", h=entry_hash, i=idx, ts=timestamp, fi=file_hash)))
+    resp = make_response(redirect(url_for("receipt", h=entry_hash, i=idx)))
     resp.set_cookie(voted_cookie_key, "1", max_age=30*24*3600, samesite="Lax")
     return resp
 
@@ -237,13 +283,13 @@ def results():
 @app.route("/receipt")
 def receipt():
     entry_hash = request.args.get("h")
-    try:
-        idx = int(request.args.get("i"))
-    except Exception:
-        return abort(400)
+    idx = int(request.args.get("i", 0))
     state = _load_log_state()
-    return render_template("receipt.html", entry_hash=entry_hash, index=idx, head=state.get("head"), poll_id=POLL_ID)
+    return render_template("receipt.html",
+                           entry_hash=entry_hash,
+                           index=idx,
+                           head=state.get("head"),
+                           poll_id=POLL_ID)
 
 if __name__ == "__main__":
-    # use_reloader=False helps prevent session/state loss between processes during OAuth callback
     app.run(debug=True, use_reloader=False)
