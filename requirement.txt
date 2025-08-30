@@ -2,3 +2,4 @@ Flask
 opentimestamps-client
 authlib
 python-dotenv
+eth-account
