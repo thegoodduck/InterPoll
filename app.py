@@ -11,6 +11,9 @@ from authlib.integrations.flask_client import OAuth
 from authlib.jose import jwt
 from dotenv import load_dotenv
 import requests
+import uuid
+from eth_account.messages import encode_defunct
+from eth_account import Account
 
 # --- File/dir constants ---
 VOTE_DIR = "votes"
@@ -28,6 +31,9 @@ oauth = OAuth(app)
 # --- Idena verification endpoint (configurable) ---
 IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "https://api.idena.io/api/Signature/Verify")
 IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "simple")
+
+# In-memory Idena auth sessions (token -> {nonce,address,authenticated})
+idena_sessions = {}
 
 # --- Google OAuth (optional) ---
 google_id = os.getenv("GOOGLE_CLIENT_ID")
@@ -140,6 +146,60 @@ def rebuild_counts_and_anomalies():
         except Exception as e:
             anomalies.append({"type": "read_error", "filename": filename, "error": str(e)})
     return counts, anomalies
+
+# ---------------------------
+# Idena Session Auth Flow (nonce + signature) per provided spec
+# ---------------------------
+@app.route("/auth/v1/start-session", methods=["POST"])
+def idena_start_session():
+    data = request.get_json(silent=True) or {}
+    token = data.get("token")
+    address = (data.get("address") or "").strip()
+    if not token or not address:
+        return {"success": False, "error": "Missing token or address"}, 400
+    nonce = f"signin-{uuid.uuid4()}"
+    idena_sessions[token] = {"nonce": nonce, "address": address.lower(), "authenticated": False}
+    return {"success": True, "data": {"nonce": nonce}}
+
+@app.route("/auth/v1/authenticate", methods=["POST"])
+def idena_authenticate():
+    data = request.get_json(silent=True) or {}
+    token = data.get("token")
+    signature = data.get("signature")
+    if not token or not signature:
+        return {"success": False, "error": "Missing token or signature"}, 400
+    sess = idena_sessions.get(token)
+    if not sess:
+        return {"success": False, "error": "Unknown session"}, 400
+    nonce = sess["nonce"]
+    expected_address = sess["address"]
+    try:
+        message = encode_defunct(text=nonce)
+        recovered = Account.recover_message(message, signature=signature).lower()
+    except Exception as e:
+        logging.warning("Idena signature recovery failed: %s", e)
+        return {"success": True, "data": {"authenticated": False}}
+    if recovered == expected_address:
+        sess["authenticated"] = True
+        return {"success": True, "data": {"authenticated": True}}
+    return {"success": True, "data": {"authenticated": False}}
+
+@app.route("/auth/v1/get-account", methods=["GET"])
+def idena_get_account():
+    token = request.args.get("token")
+    sess = idena_sessions.get(token)
+    if sess and sess.get("authenticated"):
+        return {"success": True, "data": {"address": sess["address"]}}
+    return {"success": False, "error": "Not authenticated"}
+
+@app.route("/auth/v1/callback")
+def idena_callback():
+    token = request.args.get("token")
+    sess = idena_sessions.get(token)
+    if sess and sess.get("authenticated"):
+        session["user"] = {"_provider": "idena", "address": sess["address"], "session_token": token}
+        return redirect(url_for("index"))
+    return "Login failed", 403
 
 # ---------------------------
 # Idena Auth
