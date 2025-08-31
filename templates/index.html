@@ -33,20 +33,9 @@
         });
     </script>
     <script>
-        // Idena login handler
-        async function loginWithIdena() {
-            try {
-                // Step 1: get challenge from backend
-                let res = await fetch("{{ url_for('login_idena') }}");
-                let data = await res.json();
-                let challenge = data.challenge;
-
-                // Step 2: open Idena app for signing
-                const url = `idena://signin?token=${challenge}&callback_url=${encodeURIComponent(window.location.origin + "{{ url_for('auth_idena') }}")}`;
-                window.location.href = url;
-            } catch (err) {
-                alert("Idena login failed: " + err);
-            }
+        // Idena login handler: backend builds sign-in URL & redirects
+        function loginWithIdena() {
+            window.location.href = "{{ url_for('login_idena') }}";
         }
     </script>
 </head>
