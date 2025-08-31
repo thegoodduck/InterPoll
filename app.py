@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+Flask polling app with integrated Idena sign-in (full start→authenticate→callback flow),
+atomic vote storage, transparency logging, optional Google OAuth.
+
+This version includes a `login_idena` route to avoid BuildError when templates call
+url_for('login_idena').
+"""
 import os
 import secrets
 import subprocess
@@ -6,255 +14,293 @@ from datetime import datetime, timezone
 import json
 import logging
 from collections import Counter
-from flask import Flask, render_template, request, redirect, url_for, make_response, abort, session
+from flask import Flask, render_template, request, redirect, url_for, make_response, session
 from authlib.integrations.flask_client import OAuth
-from authlib.jose import jwt
 from dotenv import load_dotenv
 import requests
 import uuid
 from eth_account.messages import encode_defunct
 from eth_account import Account
+import tempfile
+import fcntl
+import errno
+from urllib.parse import urlencode, quote_plus
 
-# --- File/dir constants ---
-VOTE_DIR = "votes"
-DB_FILE = "votes_db.json"
-LOG_FILE = "votes_log.jsonl"
-LOG_STATE = "log_state.json"
-CHAIN_HEAD_FILE = "chain_head.txt"
-
+# --- Config & Constants ---
 load_dotenv()
-
+VOTE_DIR = os.getenv("VOTE_DIR", "votes")
+DB_FILE = os.getenv("DB_FILE", "votes_db.json")
+LOG_FILE = os.getenv("LOG_FILE", "votes_log.jsonl")
+LOG_STATE = os.getenv("LOG_STATE", "log_state.json")
+CHAIN_HEAD_FILE = os.getenv("CHAIN_HEAD_FILE", "chain_head.txt")
+IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "")
+IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "local").lower()
+# If set to "1" use desktop dna:// scheme, otherwise use https://app.idena.io
+IDENA_USE_DESKTOP = os.getenv("IDENA_USE_DESKTOP", "0") == "1"
+POLL_ID = os.getenv("POLL_ID", "poll_001")
+POLL_QUESTION = os.getenv("POLL_QUESTION", "Do you support this proposal?")
+POLL_OPTIONS = json.loads(os.getenv("POLL_OPTIONS_JSON", '["Yes","No","Maybe"]'))
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
+app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
 oauth = OAuth(app)
-
-# --- Idena verification endpoint (configurable) ---
-IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "https://api.idena.io/api/Signature/Verify")
-IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "simple")
-
-# In-memory Idena auth sessions (token -> {nonce,address,authenticated})
-idena_sessions = {}
-
-# --- Google OAuth (optional) ---
-google_id = os.getenv("GOOGLE_CLIENT_ID")
-google_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-if google_id and google_secret:
-    oauth.register(
-        name='google',
-        client_id=google_id,
-        client_secret=google_secret,
-        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-        client_kwargs={'scope': 'openid email profile'}
-    )
+if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
+    oauth.register(name='google',
+                   client_id=os.getenv("GOOGLE_CLIENT_ID"),
+                   client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+                   server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+                   client_kwargs={'scope': 'openid email profile'})
 else:
-    logging.warning("Google OAuth not configured")
+    logging.getLogger().warning("Google OAuth not configured")
+idena_sessions = {}
+used_nonces = set()
+logger = logging.getLogger("poll_app")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-# --- Poll Setup ---
-POLL_ID = "poll_001"
-POLL_QUESTION = "Do you support this proposal?"
-POLL_OPTIONS = ["Yes", "No", "Maybe"]
+# --- File utilities: atomic writes & locks ---
+class FileLock:
+    def __init__(self, path):
+        self.path = path
+        self.f = None
 
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self.f = open(self.path, "a+")
+        while True:
+            try:
+                fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+                break
+            except IOError as e:
+                if e.errno != errno.EINTR:
+                    raise
+        return self.f
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+
+def atomic_write_json(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path) or ".") as tf:
+        json.dump(obj, tf, indent=2)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp = tf.name
+    os.replace(tmp, path)
+
+def atomic_write_text(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path) or ".") as tf:
+        tf.write(text)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp = tf.name
+    os.replace(tmp, path)
+
+# --- Vote DB and Logging ---
 if os.path.exists(DB_FILE):
-    with open(DB_FILE, "r") as f:
-        votes_db = json.load(f)
+    try:
+        with open(DB_FILE, "r") as f:
+            votes_db = json.load(f)
+    except Exception:
+        logger.exception("Cannot load DB; starting fresh.")
+        votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
 else:
     votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
 
 def save_db():
-    with open(DB_FILE, "w") as f:
-        json.dump(votes_db, f, indent=2)
+    with FileLock(DB_FILE + ".lock"):
+        atomic_write_json(DB_FILE, votes_db)
 
-def hash_vote(vote_text):
-    return hashlib.sha256(vote_text.encode()).hexdigest()
-
-def timestamp_vote(file_path):
-    try:
-        subprocess.run(["ots", "stamp", file_path], check=True)
-    except FileNotFoundError:
-        logging.warning("OpenTimestamps CLI 'ots' not found. Skipping timestamp.")
-    except subprocess.CalledProcessError as e:
-        logging.warning("OpenTimestamps failed: %s", e)
-
-def _canonical_json(obj) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
-
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _canonical_json(obj): return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+def _sha256_hex(b: bytes): return hashlib.sha256(b).hexdigest()
 
 def _load_log_state():
     if os.path.exists(LOG_STATE):
-        with open(LOG_STATE, "r") as f:
-            return json.load(f)
-    return {"count": 0, "head": ""}
+        try:
+            with open(LOG_STATE, "r") as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Corrupt log state; resetting.")
+    return {"count":0, "head":""}
 
 def _save_log_state(state):
-    with open(LOG_STATE, "w") as f:
-        json.dump(state, f, indent=2)
+    with FileLock(LOG_STATE + ".lock"):
+        atomic_write_json(LOG_STATE, state)
 
 def append_transparency_log(entry: dict):
     state = _load_log_state()
-    prev_head_hex = state.get("head", "")
-    prev_head_bytes = bytes.fromhex(prev_head_hex) if prev_head_hex else b""
-    entry_json = _canonical_json(entry)
-    entry_hash_hex = _sha256_hex(entry_json.encode("utf-8"))
-    entry_hash_bytes = bytes.fromhex(entry_hash_hex)
-    new_head_hex = _sha256_hex(prev_head_bytes + entry_hash_bytes)
-    index = state.get("count", 0)
-    record = {"index": index, "entry": entry, "entry_hash": entry_hash_hex, "chain_head": new_head_hex}
-    with open(LOG_FILE, "a") as f:
-        f.write(_canonical_json(record) + "\n")
-    state["count"] = index + 1
-    state["head"] = new_head_hex
-    _save_log_state(state)
-    with open(CHAIN_HEAD_FILE, "w") as f:
-        f.write(f"poll={POLL_ID}\nindex={index}\nhead={new_head_hex}\n")
-    timestamp_vote(CHAIN_HEAD_FILE)
-    return entry_hash_hex, new_head_hex, index
+    prev = bytes.fromhex(state.get("head","")) if state.get("head") else b""
+    ej = _canonical_json(entry)
+    eh = _sha256_hex(ej.encode())
+    nh = _sha256_hex(prev + bytes.fromhex(eh))
+    idx = state.get("count", 0)
+    rec = {"index": idx, "entry": entry, "entry_hash": eh, "chain_head": nh}
+    with FileLock(LOG_FILE + ".lock"):
+        with open(LOG_FILE, "a") as f:
+            f.write(_canonical_json(rec) + "\n")
+        state["count"] = idx + 1
+        state["head"] = nh
+        _save_log_state(state)
+        atomic_write_text(CHAIN_HEAD_FILE, f"poll={POLL_ID}\nindex={idx}\nhead={nh}\n")
+    try:
+        subprocess.run(["ots", "stamp", CHAIN_HEAD_FILE], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        logger.debug("ots not installed")
+    except Exception as e:
+        logger.warning("ots error: %s", e)
+    return eh, nh, idx
 
 def iter_log_entries():
     if not os.path.exists(LOG_FILE):
         return
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE) as f:
         for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                logger.exception("bad log entry")
+                continue
 
 def rebuild_counts_and_anomalies():
-    counts = Counter({opt: 0 for opt in POLL_OPTIONS})
+    counts = Counter({opt:0 for opt in POLL_OPTIONS})
     anomalies = []
     for rec in iter_log_entries() or []:
-        entry = rec.get("entry", {})
-        choice = entry.get("choice")
-        if choice in counts:
-            counts[choice] += 1
-        filename = entry.get("filename") or f"{entry.get('id','')}.txt"
-        file_hash = entry.get("file_hash") or entry.get("id")
-        path = os.path.join(VOTE_DIR, filename)
-        if not os.path.exists(path):
-            anomalies.append({"type": "missing_file", "filename": filename})
+        e = rec.get("entry",{})
+        c = e.get("choice")
+        if c in counts:
+            counts[c] += 1
+        fn = e.get("filename") or f"{e.get('id','')}.txt"
+        fh = e.get("file_hash") or e.get("id")
+        p = os.path.join(VOTE_DIR, fn)
+        if not os.path.exists(p):
+            anomalies.append({"type": "missing_file", "filename": fn})
             continue
         try:
-            with open(path, "rb") as vf:
-                data = vf.read()
-            actual = hashlib.sha256(data).hexdigest()
-            if file_hash and actual != file_hash:
-                anomalies.append({"type": "hash_mismatch", "filename": filename})
-        except Exception as e:
-            anomalies.append({"type": "read_error", "filename": filename, "error": str(e)})
+            with open(p, "rb") as vf:
+                data_bytes = vf.read()
+            a = hashlib.sha256(data_bytes).hexdigest()
+            if fh and a != fh:
+                anomalies.append({"type": "hash_mismatch", "filename": fn})
+        except Exception as ex:
+            anomalies.append({"type": "read_error", "filename": fn, "error": str(ex)})
     return counts, anomalies
 
-# ---------------------------
-# Idena Session Auth Flow (nonce + signature) per provided spec
-# ---------------------------
+# --- Idena verification ---
+def verify_eth_signature_local(address: str, message: str, signature: str) -> bool:
+    try:
+        msg = encode_defunct(text=message)
+        recovered = Account.recover_message(msg, signature=signature)
+        return recovered.lower() == address.lower()
+    except Exception:
+        return False
+
+def verify_idena_signature(address: str, message: str, signature: str) -> bool:
+    if IDENA_VERIFY_METHOD == "remote" and IDENA_VERIFY_URL:
+        try:
+            r = requests.post(IDENA_VERIFY_URL, json={"address":address,"message":message,"signature":signature}, timeout=10)
+            if not r.ok:
+                return False
+            d = r.json()
+            return bool(d.get("result") or d.get("success") or d.get("ok"))
+        except Exception:
+            logger.exception("Remote verify failed")
+            return False
+    return verify_eth_signature_local(address, message, signature)
+
+# --- Idena sign-in endpoints ---
 @app.route("/auth/v1/start-session", methods=["POST"])
 def idena_start_session():
     data = request.get_json(silent=True) or {}
     token = data.get("token")
-    address = (data.get("address") or "").strip()
+    address = (data.get("address") or "").strip().lower()
     if not token or not address:
-        return {"success": False, "error": "Missing token or address"}, 400
+        return {"success":False, "error":"Missing token or address"}, 400
     nonce = f"signin-{uuid.uuid4()}"
-    idena_sessions[token] = {"nonce": nonce, "address": address.lower(), "authenticated": False}
-    return {"success": True, "data": {"nonce": nonce}}
+    idena_sessions[token] = {"nonce":nonce, "address":address, "authenticated":False}
+    return {"success":True, "data":{"nonce":nonce}}
 
 @app.route("/auth/v1/authenticate", methods=["POST"])
 def idena_authenticate():
     data = request.get_json(silent=True) or {}
     token = data.get("token")
-    signature = data.get("signature")
-    if not token or not signature:
-        return {"success": False, "error": "Missing token or signature"}, 400
+    sig = data.get("signature")
+    if not token or not sig:
+        return {"success":False, "error":"Missing token or signature"}, 400
     sess = idena_sessions.get(token)
     if not sess:
-        return {"success": False, "error": "Unknown session"}, 400
-    nonce = sess["nonce"]
-    expected_address = sess["address"]
-    try:
-        message = encode_defunct(text=nonce)
-        recovered = Account.recover_message(message, signature=signature).lower()
-    except Exception as e:
-        logging.warning("Idena signature recovery failed: %s", e)
-        return {"success": True, "data": {"authenticated": False}}
-    if recovered == expected_address:
+        return {"success":False, "error":"Unknown session"}, 400
+    nonce = sess.get("nonce")
+    addr = sess.get("address")
+    if nonce in used_nonces:
+        logger.info("Nonce replay: %s", nonce)
+        return {"success":True, "data":{"authenticated":False}}
+    ok = verify_idena_signature(addr, nonce, sig)
+    if ok:
         sess["authenticated"] = True
+        used_nonces.add(nonce)
+        logger.info("Idena auth ok %s", addr)
         return {"success": True, "data": {"authenticated": True}}
-    return {"success": True, "data": {"authenticated": False}}
-
-@app.route("/auth/v1/get-account", methods=["GET"])
-def idena_get_account():
-    token = request.args.get("token")
-    sess = idena_sessions.get(token)
-    if sess and sess.get("authenticated"):
-        return {"success": True, "data": {"address": sess["address"]}}
-    return {"success": False, "error": "Not authenticated"}
+    else:
+        return {"success": True, "data": {"authenticated": False}}
 
 @app.route("/auth/v1/callback")
 def idena_callback():
     token = request.args.get("token")
     sess = idena_sessions.get(token)
     if sess and sess.get("authenticated"):
-        session["user"] = {"_provider": "idena", "address": sess["address"], "session_token": token}
+        session["user"] = {"_provider":"idena", "address":sess["address"], "session_token":token}
         return redirect(url_for("index"))
     return "Login failed", 403
 
-# ---------------------------
-# Idena Auth
-# ---------------------------
-def verify_idena_signature(address: str, message: str, signature: str) -> bool:
-    try:
-        r = requests.post(IDENA_VERIFY_URL, json={
-            "address": address,
-            "message": message,
-            "signature": signature
-        }, timeout=10)
-        if not r.ok:
-            return False
-        data = r.json()
-        return bool(data.get("result") or data.get("success") or data.get("ok"))
-    except Exception as e:
-        logging.exception("Idena verify failed: %s", e)
-        return False
+# Backward compatibility for legacy templates referencing 'auth_idena'
+@app.route("/auth/idena", methods=["GET", "POST"])
+def auth_idena_compat():
+    token = request.values.get("token")
+    if token:
+        return redirect(url_for("idena_callback", token=token))
+    return ("Provide ?token=... or update client to use /auth/v1/callback", 400)
 
-@app.route("/login/idena/start")
+# --- New route: explicit login_idena endpoint (used by templates that call url_for('login_idena')) ---
+@app.route("/login/idena")
 def login_idena():
-    challenge = secrets.token_hex(16)
-    session["idena_challenge"] = challenge
-    return render_template("idena_start.html", challenge=challenge)
-
-@app.route("/auth/idena", methods=["POST"])
-def auth_idena():
-    """Handle Idena auth via JWT id_token posted from client.
-
-    Expected form fields:
-      - id_token: JWT containing address claim (and others)
     """
-    id_token = request.form.get("id_token", "").strip()
-    if not id_token:
-        return "Missing id_token", 400
-    try:
-        # For simplicity we skip signature verification (would require Idena JWKS); we still parse & validate exp.
-        claims = jwt.decode(id_token, key=None, claims_options={"iss": None, "aud": None})
-        claims.validate()
-        address = claims.get("address") or claims.get("addr") or claims.get("sub")
-        if not address:
-            return "No address in token", 400
-        session["user"] = {"_provider": "idena", "address": address, "claims": dict(claims)}
-        return redirect(url_for("index"))
-    except Exception as e:
-        logging.exception("Idena JWT parse failed: %s", e)
-        return "Invalid id_token", 400
+    Redirect user to Idena sign-in URL.
+    Uses https://app.idena.io/dna/signin by default; set IDENA_USE_DESKTOP=1 to use dna:// scheme.
+    """
+    token = secrets.token_urlsafe(16)
+    callback = url_for("idena_callback", _external=True)
+    nonce_endpoint = url_for("idena_start_session", _external=True)
+    auth_endpoint = url_for("idena_authenticate", _external=True)
+    favicon = url_for("static", filename="favicon.ico", _external=True)
 
-# --- Routes ---
-@app.route("/")
-def index():
-    voted = request.cookies.get(f"voted_{POLL_ID}") is not None
-    user = session.get("user")
-    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS, voted=voted, user=user)
+    params = {
+        "token": token,
+        "callback_url": callback,
+        "nonce_endpoint": nonce_endpoint,
+        "authentication_endpoint": auth_endpoint,
+        "favicon_url": favicon
+    }
 
+    if IDENA_USE_DESKTOP:
+        # dna:// scheme needs percent-encoding for callback_url etc.
+        # build dna URI manually
+        q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
+        signin_uri = f"dna://signin/v1?{q}"
+    else:
+        signin_uri = "https://app.idena.io/dna/signin?" + urlencode(params)
+
+    return redirect(signin_uri)
+
+# --- Optional JWT-based Idena login omitted for brevity ---
+
+# --- Google OAuth login and logout endpoints ---
 @app.route("/login/google")
 def login_google():
     redirect_uri = url_for("auth_google", _external=True)
@@ -263,10 +309,10 @@ def login_google():
 @app.route("/auth/google")
 def auth_google():
     oauth.google.authorize_access_token()
-    user = oauth.google.userinfo()
-    if user:
-        user["_provider"] = "google"
-        session["user"] = user
+    u = oauth.google.userinfo()
+    if u:
+        u["_provider"] = "google"
+        session["user"] = u
     return redirect(url_for("index"))
 
 @app.route("/logout")
@@ -274,64 +320,84 @@ def logout():
     session.pop("user", None)
     return redirect(url_for("index"))
 
-# --- Voting ---
+# --- Main web routes ---
+@app.route("/")
+def index():
+    voted = request.cookies.get(f"voted_{POLL_ID}") is not None
+    user = session.get("user")
+    signin_link = None
+    if not user:
+        # for templates that expect signin_link
+        token = secrets.token_urlsafe(16)
+        app_callback = url_for("idena_callback", _external=True)
+        start = url_for("idena_start_session", _external=True)
+        auth = url_for("idena_authenticate", _external=True)
+        favicon = url_for("static", filename="favicon.ico", _external=True)
+        params = {
+            "token": token,
+            "callback_url": app_callback,
+            "nonce_endpoint": start,
+            "authentication_endpoint": auth,
+            "favicon_url": favicon
+        }
+        if IDENA_USE_DESKTOP:
+            q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
+            signin_link = f"dna://signin/v1?{q}"
+        else:
+            signin_link = "https://app.idena.io/dna/signin?" + urlencode(params)
+
+    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS,
+                           voted=voted, user=user, signin_link=signin_link)
+
 @app.route("/vote", methods=["POST"])
 def vote():
-    vote_choice = request.form.get("vote")
-    if vote_choice not in POLL_OPTIONS:
+    choice = request.form.get("vote")
+    if choice not in POLL_OPTIONS:
         return "Invalid vote option!", 400
-
-    voted_cookie_key = f"voted_{POLL_ID}"
+    cookie_key = f"voted_{POLL_ID}"
     user = session.get("user") or {}
     provider = user.get("_provider")
-    if provider == "idena":
-        identity = f"idena:{user.get('address','')}"
-    elif provider:
-        identity = f"{provider}:{user.get('sub') or user.get('id')}"
-    else:
-        identity = ""
-
+    identity = (f"idena:{user['address']}" if provider=="idena"
+                else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
     if identity:
-        for v in votes_db["votes"].values():
-            if v.get("identity") == identity:
-                return redirect(url_for("results"))
-    if request.cookies.get(voted_cookie_key):
+        if any(v.get("identity")==identity for v in votes_db["votes"].values()):
+            return redirect(url_for("results"))
+    if request.cookies.get(cookie_key):
         return redirect(url_for("results"))
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    user_agent = request.headers.get("User-Agent", "")[:400]
-
-    vote_data = f"{vote_choice}|{timestamp}|{client_ip}|{user_agent}|{identity}"
-    file_hash = hash_vote(vote_data)
+    ts = datetime.now(timezone.utc).isoformat()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = (request.headers.get("User-Agent","") or "")[:400]
+    vote_data = f"{choice}|{ts}|{ip}|{ua}|{identity}"
+    file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
     os.makedirs(VOTE_DIR, exist_ok=True)
-    file_name = f"{VOTE_DIR}/{file_hash}.txt"
-    with open(file_name, "w") as f:
-        f.write(vote_data)
-    timestamp_vote(file_name)
-
-    votes_db["votes"][file_hash] = {
-        "choice": vote_choice,
-        "timestamp": timestamp,
-        "ip": client_ip,
-        "ua": user_agent,
-        "identity": identity
-    }
-    votes_db["counts"][vote_choice] += 1
-    save_db()
-
-    log_entry = {
-        "poll": POLL_ID,
-        "choice": vote_choice,
-        "timestamp": timestamp,
-        "id": file_hash,
-        "identity": identity,
-        "file_hash": file_hash,
-        "filename": f"{file_hash}.txt"
-    }
-    entry_hash, head, idx = append_transparency_log(log_entry)
-    resp = make_response(redirect(url_for("receipt", h=entry_hash, i=idx)))
-    resp.set_cookie(voted_cookie_key, "1", max_age=30*24*3600, samesite="Lax")
+    fn = os.path.join(VOTE_DIR, f"{file_hash}.txt")
+    try:
+        atomic_write_text(fn, vote_data)
+    except Exception:
+        logger.exception("Vote file error")
+        return "Error saving vote", 500
+    try:
+        subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        # stamping is best-effort
+        pass
+    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "ip":ip, "ua":ua, "identity":identity}
+    votes_db["counts"].setdefault(choice, 0)
+    votes_db["counts"][choice] += 1
+    try:
+        save_db()
+    except Exception:
+        logger.exception("save_db error")
+    entry = {"poll":POLL_ID,"choice":choice,"timestamp":ts,"id":file_hash,
+             "identity":identity,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
+    try:
+        eh, _chain_head, idx = append_transparency_log(entry)
+    except Exception:
+        logger.exception("log append error")
+        eh, idx = None, 0
+    resp = make_response(redirect(url_for("receipt", h=eh or "", i=idx)))
+    secure = os.getenv("PRODUCTION","").lower() in ("1","true")
+    resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
     return resp
 
 @app.route("/results")
@@ -342,14 +408,24 @@ def results():
 
 @app.route("/receipt")
 def receipt():
-    entry_hash = request.args.get("h")
-    idx = int(request.args.get("i", 0))
+    entry_hash = request.args.get("h","")
+    idx = int(request.args.get("i",0))
     state = _load_log_state()
-    return render_template("receipt.html",
-                           entry_hash=entry_hash,
-                           index=idx,
-                           head=state.get("head"),
-                           poll_id=POLL_ID)
+    return render_template("receipt.html", entry_hash=entry_hash, index=idx, head=state.get("head"), poll_id=POLL_ID)
 
+@app.route("/_internal/status")
+def status():
+    return {"ok":True, "poll":POLL_ID, "votes":len(votes_db["votes"]), "counts":votes_db["counts"]}
+
+# --- Server run ---
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False)
+    os.makedirs(VOTE_DIR, exist_ok=True)
+    try:
+        with FileLock(DB_FILE + ".lock"):
+            if not os.path.exists(DB_FILE):
+                atomic_write_json(DB_FILE, votes_db)
+    except Exception:
+        logger.exception("DB init error")
+    if app.secret_key == "dev-change-me":
+        logger.warning("Running with dev secret key. Change FLASK_SECRET_KEY for production.")
+    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=int(os.getenv("PORT",5000)))
