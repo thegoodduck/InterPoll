@@ -33,10 +33,67 @@
         });
     </script>
     <script>
-        // Idena login handler: backend builds sign-in URL & redirects
-        function loginWithIdena() {
-            window.location.href = "{{ url_for('login_idena') }}";
+        // Idena login with polling while keeping current page intact to avoid about:blank navigation issues.
+        async function loginWithIdena() {
+            const statusEl = ensureStatusEl();
+            setStatus(statusEl, 'Starting Idena login…');
+            try {
+                const initRes = await fetch('/auth/v1/init', {method:'POST'});
+                const initData = await initRes.json();
+                if(!initData.success) { setStatus(statusEl, 'Init failed'); return; }
+                const token = initData.token;
+                // Open external wallet / web signin without unloading this page.
+                const url = initData.signin_url;
+                try {
+                    if (url.startsWith('dna://')) {
+                        // custom protocol: simulate click on hidden link
+                        const a = document.createElement('a');
+                        a.href = url; a.style.display='none'; document.body.appendChild(a); a.click();
+                    } else {
+                        window.open(url, '_blank', 'noopener');
+                    }
+                } catch(openErr) {
+                    setStatus(statusEl, 'Popup blocked – please allow popups or click this link: ' + url);
+                }
+                const start = Date.now();
+                const poll = async () => {
+                    if (Date.now() - start > 180000) { setStatus(statusEl, 'Login timed out.'); return; }
+                    try {
+                        const r = await fetch(`/auth/v1/status?token=${encodeURIComponent(token)}`);
+                        if (r.ok) {
+                            const s = await r.json();
+                            if (s.authenticated) {
+                                setStatus(statusEl, 'Finalizing…');
+                                await fetch('/auth/v1/finalize', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token})});
+                                window.location.reload();
+                                return;
+                            }
+                        }
+                    } catch(e) {
+                        /* ignore transient errors */
+                    }
+                    setTimeout(poll, 2000);
+                };
+                setTimeout(poll, 2000);
+                setStatus(statusEl, 'Waiting for signature in wallet…');
+            } catch (e) {
+                setStatus(statusEl, 'Error: ' + e);
+            }
         }
+        function ensureStatusEl(){
+            let el = document.getElementById('idenaStatus');
+            if(!el){
+                el = document.createElement('div');
+                el.id = 'idenaStatus';
+                el.style.marginTop = '0.75rem';
+                el.style.fontSize = '0.8rem';
+                el.style.color = '#374151';
+                const container = document.querySelector('.card');
+                container.appendChild(el);
+            }
+            return el;
+        }
+        function setStatus(el, msg){ el.textContent = msg; }
     </script>
 </head>
 <body data-voted="{{ 'true' if voted else 'false' }}">
