@@ -25,6 +25,7 @@ import tempfile
 import fcntl
 import errno
 from urllib.parse import urlencode, quote_plus
+from werkzeug.routing import BuildError
 
 # --- Config & Constants ---
 load_dotenv()
@@ -215,49 +216,114 @@ def verify_idena_signature(address: str, message: str, signature: str) -> bool:
     return verify_eth_signature_local(address, message, signature)
 
 # --- Idena sign-in endpoints ---
-@app.route("/auth/v1/start-session", methods=["POST"])
-def idena_start_session():
+@app.route("/auth/v1/init", methods=["POST"])
+def idena_init():
+    """Initialize an Idena login attempt and return sign-in URL + token.
+    Front-end will open the sign-in URL (which triggers the wallet) and then poll /auth/v1/status.
+    Once authenticated, it will POST /auth/v1/finalize to bind session in the current browser.
+    """
+    token = secrets.token_urlsafe(16)
+    try:
+        callback = url_for("idena_callback", _external=True)
+    except BuildError:
+        # Fallback to finalize if callback route not registered yet
+        callback = url_for("idena_finalize", _external=True)
+    nonce_endpoint = url_for("idena_start_session", _external=True)
+    auth_endpoint = url_for("idena_authenticate", _external=True)
+    favicon = url_for("static", filename="favicon.ico", _external=True)
+    params = {
+        "token": token,
+        "callback_url": callback,
+        "nonce_endpoint": nonce_endpoint,
+        "authentication_endpoint": auth_endpoint,
+        "auth_endpoint": auth_endpoint,
+        "favicon_url": favicon
+    }
+    if token not in idena_sessions:
+        idena_sessions[token] = {"nonce": None, "address": None, "authenticated": False}
+    if IDENA_USE_DESKTOP:
+        q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
+        signin_uri = f"dna://signin/v1?{q}"
+    else:
+        signin_uri = "https://app.idena.io/dna/signin?" + urlencode(params)
+    return {"success": True, "token": token, "signin_url": signin_uri}
+
+@app.route("/auth/v1/status")
+def idena_status():
+    token = request.args.get("token")
+    sess = idena_sessions.get(token)
+    if not sess:
+        return {"success": False, "error": "unknown_token"}, 404
+    return {"success": True, "authenticated": bool(sess.get("authenticated")), "address": sess.get("address"), "has_nonce": bool(sess.get("nonce"))}
+
+@app.route("/auth/v1/finalize", methods=["POST"])
+def idena_finalize():
     data = request.get_json(silent=True) or {}
     token = data.get("token")
-    address = (data.get("address") or "").strip().lower()
-    if not token or not address:
-        return {"success":False, "error":"Missing token or address"}, 400
+    sess = idena_sessions.get(token)
+    if not sess or not sess.get("authenticated"):
+        return {"success": False, "error": "not_authenticated"}, 400
+    session["user"] = {"_provider": "idena", "address": sess.get("address"), "session_token": token}
+    return {"success": True}
+@app.route("/auth/v1/start-session", methods=["POST"])
+def idena_start_session():
+    # Accept JSON, form, or query params
+    raw_json = request.get_json(silent=True) or {}
+    token = (raw_json.get("token") or request.form.get("token") or request.args.get("token"))
+    address = (raw_json.get("address") or request.form.get("address") or request.args.get("address") or "").strip().lower()
+    logger.debug("start-session inbound token=%s address=%s content_type=%s", token, address, request.content_type)
+    if not token:
+        logger.info("start-session missing token (addr=%s)", address)
+        return {"success": False, "error": "missing_token"}, 400
     nonce = f"signin-{uuid.uuid4()}"
-    idena_sessions[token] = {"nonce":nonce, "address":address, "authenticated":False}
-    return {"success":True, "data":{"nonce":nonce}}
+    idena_sessions[token] = {"nonce": nonce, "address": address or None, "authenticated": False}
+    logger.info("start-session token=%s addr=%s nonce=%s", token, address or None, nonce)
+    # Return both new simple shape and legacy shape for compatibility
+    return {"nonce": nonce, "success": True, "data": {"nonce": nonce}}
 
 @app.route("/auth/v1/authenticate", methods=["POST"])
 def idena_authenticate():
-    data = request.get_json(silent=True) or {}
-    token = data.get("token")
-    sig = data.get("signature")
+    raw_json = request.get_json(silent=True) or {}
+    token = (raw_json.get("token") or request.form.get("token") or request.args.get("token"))
+    sig = (raw_json.get("signature") or request.form.get("signature") or request.args.get("signature"))
+    logger.debug("authenticate inbound token=%s sig_len=%s content_type=%s", token, len(sig or ""), request.content_type)
     if not token or not sig:
-        return {"success":False, "error":"Missing token or signature"}, 400
+        return {"success": False, "error": "missing_token_or_signature"}, 400
     sess = idena_sessions.get(token)
     if not sess:
-        return {"success":False, "error":"Unknown session"}, 400
+        logger.info("authenticate unknown token=%s", token)
+        return {"success": False, "error": "unknown_session"}, 400
     nonce = sess.get("nonce")
     addr = sess.get("address")
+    if not nonce:
+        logger.info("authenticate no nonce token=%s", token)
+        return {"success": False, "error": "no_nonce"}, 400
     if nonce in used_nonces:
-        logger.info("Nonce replay: %s", nonce)
-        return {"success":True, "data":{"authenticated":False}}
+        logger.info("authenticate replay nonce=%s", nonce)
+        return {"success": True, "data": {"authenticated": False, "replay": True}}
+    if not addr:
+        # Try recover address directly
+        try:
+            msg = encode_defunct(text=nonce)
+            recovered = Account.recover_message(msg, signature=sig)
+            sess["address"] = recovered
+            sess["authenticated"] = True
+            used_nonces.add(nonce)
+            logger.info("authenticate recovered addr=%s token=%s", recovered, token)
+            return {"success": True, "authenticated": True, "address": recovered, "data": {"authenticated": True}}
+        except Exception as e:
+            logger.warning("authenticate recover failed token=%s err=%s", token, e)
+            return {"success": True, "authenticated": False, "error": "recover_failed"}
+    # Have address, verify signature
     ok = verify_idena_signature(addr, nonce, sig)
     if ok:
         sess["authenticated"] = True
         used_nonces.add(nonce)
-        logger.info("Idena auth ok %s", addr)
-        return {"success": True, "data": {"authenticated": True}}
+        logger.info("authenticate ok addr=%s token=%s", addr, token)
+        return {"success": True, "authenticated": True, "address": addr}
     else:
-        return {"success": True, "data": {"authenticated": False}}
-
-@app.route("/auth/v1/callback")
-def idena_callback():
-    token = request.args.get("token")
-    sess = idena_sessions.get(token)
-    if sess and sess.get("authenticated"):
-        session["user"] = {"_provider":"idena", "address":sess["address"], "session_token":token}
-        return redirect(url_for("index"))
-    return "Login failed", 403
+        logger.info("authenticate bad sig addr=%s token=%s", addr, token)
+        return {"success": True, "authenticated": False, "error": "bad_signature"}
 
 # Backward compatibility for legacy templates referencing 'auth_idena'
 @app.route("/auth/idena", methods=["GET", "POST"])
@@ -284,9 +350,16 @@ def login_idena():
         "token": token,
         "callback_url": callback,
         "nonce_endpoint": nonce_endpoint,
+        # Provide both keys some clients use authentication_endpoint others auth_endpoint
         "authentication_endpoint": auth_endpoint,
+        "auth_endpoint": auth_endpoint,
         "favicon_url": favicon
     }
+
+    # Pre-create empty session so callback can still succeed if wallet calls authenticate slightly later
+    if token not in idena_sessions:
+        idena_sessions[token] = {"nonce": None, "address": None, "authenticated": False}
+    logger.info("Initiating Idena login token=%s callback=%s", token, callback)
 
     if IDENA_USE_DESKTOP:
         # dna:// scheme needs percent-encoding for callback_url etc.
