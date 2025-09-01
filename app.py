@@ -3,8 +3,11 @@
 Flask polling app with integrated Idena sign-in (full start→authenticate→callback flow),
 atomic vote storage, transparency logging, optional Google OAuth.
 
-This version includes a `login_idena` route to avoid BuildError when templates call
-url_for('login_idena').
+Fixes:
+- Adds /auth/v1/callback (idena_callback) so url_for('idena_callback') actually resolves.
+- Supports BASE_URL to force absolute HTTPS URLs for web wallet (ngrok/cloudflared).
+- Adds permissive CORS for /auth/v1/* so app.idena.io can POST across origins.
+- Keeps desktop dna:// flow working with IDENA_USE_DESKTOP=1.
 """
 import os
 import secrets
@@ -14,7 +17,12 @@ from datetime import datetime, timezone
 import json
 import logging
 from collections import Counter
-from flask import Flask, render_template, request, redirect, url_for, make_response, session
+from urllib.parse import urlencode, quote_plus, urljoin
+
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    make_response, session, Response
+)
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import requests
@@ -24,7 +32,6 @@ from eth_account import Account
 import tempfile
 import fcntl
 import errno
-from urllib.parse import urlencode, quote_plus
 from werkzeug.routing import BuildError
 
 # --- Config & Constants ---
@@ -34,16 +41,29 @@ DB_FILE = os.getenv("DB_FILE", "votes_db.json")
 LOG_FILE = os.getenv("LOG_FILE", "votes_log.jsonl")
 LOG_STATE = os.getenv("LOG_STATE", "log_state.json")
 CHAIN_HEAD_FILE = os.getenv("CHAIN_HEAD_FILE", "chain_head.txt")
+
 IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "")
 IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "local").lower()
+
 # If set to "1" use desktop dna:// scheme, otherwise use https://app.idena.io
 IDENA_USE_DESKTOP = os.getenv("IDENA_USE_DESKTOP", "0") == "1"
+
+# If you’re using the web wallet, set this to your public HTTPS base (e.g., https://x.ngrok-free.app)
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+
 POLL_ID = os.getenv("POLL_ID", "poll_001")
 POLL_QUESTION = os.getenv("POLL_QUESTION", "Do you support this proposal?")
 POLL_OPTIONS = json.loads(os.getenv("POLL_OPTIONS_JSON", '["Yes","No","Maybe"]'))
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
 app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
+
+# If you actually want Flask to generate external URLs using BASE_URL host, you can optionally set:
+# - Prefer using BASE_URL inside helper _abs_url() below
+# app.config["SERVER_NAME"] = (BASE_URL.replace("https://", "").replace("http://", "") if BASE_URL else None)
+# app.config["PREFERRED_URL_SCHEME"] = "https"
+
 oauth = OAuth(app)
 if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
     oauth.register(name='google',
@@ -53,6 +73,7 @@ if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
                    client_kwargs={'scope': 'openid email profile'})
 else:
     logging.getLogger().warning("Google OAuth not configured")
+
 idena_sessions = {}
 used_nonces = set()
 logger = logging.getLogger("poll_app")
@@ -61,6 +82,18 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# --- Helpers for absolute URLs ---
+def _abs_url(path_endpoint_name: str, **values) -> str:
+    """
+    Build an absolute URL. If BASE_URL is set, join to it.
+    Otherwise fall back to Flask's url_for(_external=True).
+    """
+    if BASE_URL:
+        # Make a relative path via url_for without _external, then join
+        rel = url_for(path_endpoint_name, _external=False, **values)
+        return urljoin(BASE_URL + "/", rel.lstrip("/"))
+    return url_for(path_endpoint_name, _external=True, **values)
 
 # --- File utilities: atomic writes & locks ---
 class FileLock:
@@ -215,22 +248,41 @@ def verify_idena_signature(address: str, message: str, signature: str) -> bool:
             return False
     return verify_eth_signature_local(address, message, signature)
 
+# --- Minimal CORS for /auth/v1/* ---
+CORS_PATH_PREFIX = "/auth/v1/"
+
+@app.after_request
+def add_cors_headers(resp: Response):
+    # Only add CORS headers for /auth/v1/* endpoints
+    try:
+        if request.path.startswith(CORS_PATH_PREFIX):
+            origin = request.headers.get("Origin")
+            # In dev, be generous. In prod, pin to https://app.idena.io if you want.
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    except Exception:
+        pass
+    return resp
+
+@app.route(CORS_PATH_PREFIX + "<path:sub>", methods=["OPTIONS"])
+def cors_preflight(sub):
+    resp = make_response("", 204)
+    return add_cors_headers(resp)
+
 # --- Idena sign-in endpoints ---
 @app.route("/auth/v1/init", methods=["POST"])
 def idena_init():
-    """Initialize an Idena login attempt and return sign-in URL + token.
-    Front-end will open the sign-in URL (which triggers the wallet) and then poll /auth/v1/status.
-    Once authenticated, it will POST /auth/v1/finalize to bind session in the current browser.
-    """
     token = secrets.token_urlsafe(16)
     try:
-        callback = url_for("idena_finalize", _external=True)
+        callback = _abs_url("idena_callback")
     except BuildError:
-        # Fallback to finalize if callback route not registered yet
-        callback = url_for("idena_finalize", _external=True)
-    nonce_endpoint = url_for("idena_start_session", _external=True)
-    auth_endpoint = url_for("idena_authenticate", _external=True)
-    favicon = url_for("static", filename="favicon.ico", _external=True)
+        callback = _abs_url("idena_finalize")  # fallback (should not happen now)
+    nonce_endpoint = _abs_url("idena_start_session")
+    auth_endpoint = _abs_url("idena_authenticate")
+    favicon = _abs_url("static", filename="favicon.ico")
     params = {
         "token": token,
         "callback_url": callback,
@@ -265,9 +317,9 @@ def idena_finalize():
         return {"success": False, "error": "not_authenticated"}, 400
     session["user"] = {"_provider": "idena", "address": sess.get("address"), "session_token": token}
     return {"success": True}
+
 @app.route("/auth/v1/start-session", methods=["POST"])
 def idena_start_session():
-    # Accept JSON, form, or query params
     raw_json = request.get_json(silent=True) or {}
     token = (raw_json.get("token") or request.form.get("token") or request.args.get("token"))
     address = (raw_json.get("address") or request.form.get("address") or request.args.get("address") or "").strip().lower()
@@ -278,7 +330,6 @@ def idena_start_session():
     nonce = f"signin-{uuid.uuid4()}"
     idena_sessions[token] = {"nonce": nonce, "address": address or None, "authenticated": False}
     logger.info("start-session token=%s addr=%s nonce=%s", token, address or None, nonce)
-    # Return both new simple shape and legacy shape for compatibility
     return {"nonce": nonce, "success": True, "data": {"nonce": nonce}}
 
 @app.route("/auth/v1/authenticate", methods=["POST"])
@@ -302,7 +353,6 @@ def idena_authenticate():
         logger.info("authenticate replay nonce=%s", nonce)
         return {"success": True, "data": {"authenticated": False, "replay": True}}
     if not addr:
-        # Try recover address directly
         try:
             msg = encode_defunct(text=nonce)
             recovered = Account.recover_message(msg, signature=sig)
@@ -314,7 +364,6 @@ def idena_authenticate():
         except Exception as e:
             logger.warning("authenticate recover failed token=%s err=%s", token, e)
             return {"success": True, "authenticated": False, "error": "recover_failed"}
-    # Have address, verify signature
     ok = verify_idena_signature(addr, nonce, sig)
     if ok:
         sess["authenticated"] = True
@@ -333,37 +382,29 @@ def auth_idena_compat():
         return redirect(url_for("idena_finalize", token=token))
     return ("Provide ?token=... or update client to use /auth/v1/callback", 400)
 
-# --- New route: explicit login_idena endpoint (used by templates that call url_for('login_idena')) ---
+# --- Explicit login_idena endpoint for templates calling url_for('login_idena') ---
 @app.route("/login/idena")
 def login_idena():
-    """
-    Redirect user to Idena sign-in URL.
-    Uses https://app.idena.io/dna/signin by default; set IDENA_USE_DESKTOP=1 to use dna:// scheme.
-    """
     token = secrets.token_urlsafe(16)
-    callback = url_for("idena_finalize", _external=True)
-    nonce_endpoint = url_for("idena_start_session", _external=True)
-    auth_endpoint = url_for("idena_authenticate", _external=True)
-    favicon = url_for("static", filename="favicon.ico", _external=True)
+    callback = _abs_url("idena_callback")
+    nonce_endpoint = _abs_url("idena_start_session")
+    auth_endpoint = _abs_url("idena_authenticate")
+    favicon = _abs_url("static", filename="favicon.ico")
 
     params = {
         "token": token,
         "callback_url": callback,
         "nonce_endpoint": nonce_endpoint,
-        # Provide both keys some clients use authentication_endpoint others auth_endpoint
         "authentication_endpoint": auth_endpoint,
         "auth_endpoint": auth_endpoint,
         "favicon_url": favicon
     }
 
-    # Pre-create empty session so callback can still succeed if wallet calls authenticate slightly later
     if token not in idena_sessions:
         idena_sessions[token] = {"nonce": None, "address": None, "authenticated": False}
     logger.info("Initiating Idena login token=%s callback=%s", token, callback)
 
     if IDENA_USE_DESKTOP:
-        # dna:// scheme needs percent-encoding for callback_url etc.
-        # build dna URI manually
         q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
         signin_uri = f"dna://signin/v1?{q}"
     else:
@@ -371,12 +412,46 @@ def login_idena():
 
     return redirect(signin_uri)
 
-# --- Optional JWT-based Idena login omitted for brevity ---
+# --- NEW: Idena callback route (required) ---
+@app.route("/auth/v1/callback")
+def idena_callback():
+    """
+    The wallet redirects here with ?token=...
+    We finalize the session (POST /auth/v1/finalize) from the browser via fetch
+    and then send the user back to index.
+    """
+    token = request.args.get("token", "")
+    # Minimal HTML/JS to finalize then redirect:
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Idena Callback</title></head>
+<body>
+<script>
+(async () => {{
+  const token = {json.dumps(token)};
+  if (!token) {{
+    window.location = {json.dumps(url_for('index'))};
+    return;
+  }}
+  try {{
+    const r = await fetch({json.dumps(url_for('idena_finalize'))}, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      credentials: 'include',
+      body: JSON.stringify({{ token }})
+    }});
+  }} catch (e) {{
+    // ignore
+  }}
+  window.location = {json.dumps(url_for('index'))};
+}})();
+</script>
+</body></html>"""
+    return Response(html, mimetype="text/html")
 
 # --- Google OAuth login and logout endpoints ---
 @app.route("/login/google")
 def login_google():
-    redirect_uri = url_for("auth_google", _external=True)
+    redirect_uri = _abs_url("auth_google")
     return oauth.google.authorize_redirect(redirect_uri)
 
 @app.route("/auth/google")
@@ -400,17 +475,18 @@ def index():
     user = session.get("user")
     signin_link = None
     if not user:
-        # for templates that expect signin_link
+        # Provide signin_link for templates that render a simple anchor
         token = secrets.token_urlsafe(16)
-        app_callback = url_for("idena_finalize", _external=True)
-        start = url_for("idena_start_session", _external=True)
-        auth = url_for("idena_authenticate", _external=True)
-        favicon = url_for("static", filename="favicon.ico", _external=True)
+        app_callback = _abs_url("idena_callback")
+        start = _abs_url("idena_start_session")
+        auth = _abs_url("idena_authenticate")
+        favicon = _abs_url("static", filename="favicon.ico")
         params = {
             "token": token,
             "callback_url": app_callback,
             "nonce_endpoint": start,
             "authentication_endpoint": auth,
+            "auth_endpoint": auth,
             "favicon_url": favicon
         }
         if IDENA_USE_DESKTOP:
@@ -452,7 +528,6 @@ def vote():
     try:
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        # stamping is best-effort
         pass
     votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "ip":ip, "ua":ua, "identity":identity}
     votes_db["counts"].setdefault(choice, 0)
