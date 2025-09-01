@@ -224,7 +224,7 @@ def idena_init():
     """
     token = secrets.token_urlsafe(16)
     try:
-        callback = url_for("idena_callback", _external=True)
+        callback = url_for("idena_finalize", _external=True)
     except BuildError:
         # Fallback to finalize if callback route not registered yet
         callback = url_for("idena_finalize", _external=True)
@@ -330,7 +330,7 @@ def idena_authenticate():
 def auth_idena_compat():
     token = request.values.get("token")
     if token:
-        return redirect(url_for("idena_callback", token=token))
+        return redirect(url_for("idena_finalize", token=token))
     return ("Provide ?token=... or update client to use /auth/v1/callback", 400)
 
 # --- New route: explicit login_idena endpoint (used by templates that call url_for('login_idena')) ---
@@ -341,7 +341,7 @@ def login_idena():
     Uses https://app.idena.io/dna/signin by default; set IDENA_USE_DESKTOP=1 to use dna:// scheme.
     """
     token = secrets.token_urlsafe(16)
-    callback = url_for("idena_callback", _external=True)
+    callback = url_for("idena_finalize", _external=True)
     nonce_endpoint = url_for("idena_start_session", _external=True)
     auth_endpoint = url_for("idena_authenticate", _external=True)
     favicon = url_for("static", filename="favicon.ico", _external=True)
@@ -402,7 +402,7 @@ def index():
     if not user:
         # for templates that expect signin_link
         token = secrets.token_urlsafe(16)
-        app_callback = url_for("idena_callback", _external=True)
+        app_callback = url_for("idena_finalize", _external=True)
         start = url_for("idena_start_session", _external=True)
         auth = url_for("idena_authenticate", _external=True)
         favicon = url_for("static", filename="favicon.ico", _external=True)
