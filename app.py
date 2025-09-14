@@ -457,7 +457,7 @@ def login_google():
         'client_secrets.json',
         scopes=SCOPES
     )
-    creds = flow.run_local_server(port=0)
+    creds = flow.run_local_server(port=8080)
     service = build('oauth2', 'v2', credentials=creds)
     user_info = service.userinfo().get().execute()
     email = user_info.get('email', 'Unknown')
