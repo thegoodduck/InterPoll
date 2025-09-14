@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Create Poll</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f7f7fa; }
+        .container { max-width: 600px; margin: 40px auto; background: rgba(255,255,255,0.8); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); padding: 32px; }
+        h2 { text-align: center; }
+        label { display: block; margin-top: 16px; font-weight: bold; }
+        input, select, textarea { width: 100%; padding: 8px; margin-top: 8px; border-radius: 8px; border: 1px solid #ccc; }
+        .options-list { margin-top: 8px; }
+        .option-input { display: flex; gap: 8px; margin-bottom: 8px; }
+        button { margin-top: 24px; padding: 12px 24px; border: none; border-radius: 8px; background: #4f8cff; color: #fff; font-size: 1.1em; cursor: pointer; }
+        button:hover { background: #357ae8; }
+    </style>
+    <script>
+    function addOption() {
+        const list = document.getElementById('options-list');
+        const div = document.createElement('div');
+        div.className = 'option-input';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.name = 'options';
+        input.placeholder = 'Option';
+        input.required = true;
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.textContent = 'Remove';
+        removeBtn.onclick = function() { div.remove(); };
+
+        div.appendChild(input);
+        div.appendChild(removeBtn);
+        list.appendChild(div);
+    }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h2>Create a New Poll</h2>
+        <form method="post" action="/create_poll">
+            <label for="question">Poll Question</label>
+            <input type="text" id="question" name="question" required>
+
+            <label>Poll Options</label>
+            <div id="options-list" class="options-list">
+                <div class="option-input">
+                    <input type="text" name="options" placeholder="Option" required>
+                    <button type="button" onclick="this.parentNode.remove()">Remove</button>
+                </div>
+            </div>
+            <button type="button" onclick="addOption()">Add Option</button>
+
+            <label for="login_required">Login Required</label>
+            <select id="login_required" name="login_required">
+                <option value="none">None</option>
+                <option value="google">Google</option>
+                <option value="idena">Idena</option>
+            </select>
+
+            <label for="cookie_mode">Prevent Double Voting (Permanent Cookie)</label>
+            <select id="cookie_mode" name="cookie_mode">
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+            </select>
+
+            <button type="submit">Create Poll</button>
+        </form>
+    </div>
+</body>
+</html>

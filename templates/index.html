@@ -5,16 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>InterPoll</title>
     <style>
-        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 2rem; }
-        .card { max-width: 560px; padding: 1.5rem; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        h1 { margin-top: 0; }
-        .option { margin: 0.5rem 0; }
+        :root { --brand:#2563eb; --fg:#0f172a; --muted:#6b7280; --card:#ffffff; --line:#e5e7eb; --bg:#f8fafc; }
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 0; background: var(--bg); color: var(--fg); }
+        .shell { max-width: 880px; margin: 32px auto; padding: 0 16px; }
+        .header { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; }
+        .header h1 { margin:0; font-size: 1.5rem; letter-spacing: -0.2px; }
+        .toolbar a.btn { padding: 8px 12px; border-radius: 10px; border: 1px solid var(--brand); color:#fff; background: var(--brand); text-decoration:none; font-weight:500; }
+        .stack { display: grid; grid-template-columns: 1fr; gap: 16px; }
+        .card { background: var(--card); border:1px solid var(--line); border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 16px 18px; }
+        .section-title { margin: 0 0 8px 0; font-size: 1.1rem; }
+        .status { font-size: 0.92rem; color: var(--muted); }
+        .status .chip { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#f1f5f9; color:#334155; }
+        .option { margin: 0.5rem 0; display:block; }
         .actions { margin-top: 1rem; }
-        button { padding: 0.6rem 1rem; border-radius: 8px; border: 1px solid #2563eb; background: #2563eb; color: white; cursor: pointer; }
+        button { padding: 0.6rem 1rem; border-radius: 10px; border: 1px solid var(--brand); background: var(--brand); color: white; cursor: pointer; }
         button:disabled { background: #9ca3af; border-color: #9ca3af; cursor: not-allowed; }
-        .note { color: #6b7280; font-size: 0.9rem; }
+        .note { color: var(--muted); font-size: 0.9rem; }
         .success { color: #059669; }
-        a { color: #2563eb; text-decoration: none; }
+        a { color: var(--brand); text-decoration: none; }
+        .poll-list { list-style:none; margin: 8px 0 0 0; padding:0; }
+        .poll-item { padding: 12px 10px; border-top: 1px dashed var(--line); display:flex; align-items:baseline; gap:10px; }
+        .poll-item:first-child { border-top: none; }
+        .poll-title { font-weight: 600; }
+        .poll-meta { color: var(--muted); font-size: 0.88rem; }
     </style>
     <script>
         function onSubmit(e){
@@ -97,34 +110,79 @@
     </script>
 </head>
 <body data-voted="{{ 'true' if voted else 'false' }}">
-    <div class="card">
-        <h1>{{ question }}</h1>
-        {% if user %}
-            <p style="font-size:0.85rem;color:#374151;">Signed in as
-            {% if user.email %}{{ user.email }}{% elif user.address %}{{ user.address }}{% elif user.name %}{{ user.name }}{% else %}user{% endif %}
-            ({{ user._provider }}) · <a href="{{ url_for('logout') }}">Logout</a></p>
-        {% else %}
-            <p style="font-size:0.85rem;color:#374151;">Optional: 
-                <a href="{{ url_for('login_google') }}">Google</a> | 
-                <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>
-            </p>
-        {% endif %}
-        {% if voted %}
-            <p class="success">Thanks, your vote was recorded. You can see live results below.</p>
-        {% else %}
-        <form method="POST" onsubmit="onSubmit(event)">
-            {% for option in options %}
-            <label class="option">
-                <input type="radio" name="vote" value="{{ option }}" required> {{ option }}
-            </label><br>
-            {% endfor %}
-            <div class="actions">
-                <button id="voteBtn" type="submit">Vote</button>
+    <div class="shell">
+        <div class="header">
+            <h1>InterPoll</h1>
+            <div class="toolbar">
+                <a class="btn" href="{{ url_for('create_poll') }}">Create poll</a>
             </div>
-            <p class="note">No wallet or crypto setup needed. One vote per browser (plus optional account identity) for this MVP.</p>
-        </form>
-        {% endif %}
-        <p><a href="{{ url_for('results') }}">See results</a></p>
+        </div>
+
+        <div class="stack">
+            <!-- Auth status / entry -->
+            <div class="card">
+                <p class="section-title">Status</p>
+                {% if user %}
+                    <p class="status">Signed in as
+                        <span class="chip">
+                        {% if user.email %}{{ user.email }}{% elif user.address %}{{ user.address }}{% elif user.name %}{{ user.name }}{% else %}user{% endif %}
+                        </span>
+                        via <strong>{{ user._provider }}</strong>
+                        · <a href="{{ url_for('logout') }}">Logout</a>
+                    </p>
+                {% else %}
+                    <p class="status">Optional sign-in: 
+                        <a href="{{ url_for('login_google') }}">Google</a> · 
+                        <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>
+                    </p>
+                {% endif %}
+            </div>
+
+            <!-- Current poll card -->
+            <div class="card">
+                <p class="section-title">Current poll</p>
+                <h2 style="margin:6px 0 12px 0;">{{ question }}</h2>
+                {% if voted %}
+                    <p class="success">Thanks, your vote was recorded. You can see live results below.</p>
+                {% else %}
+                    <form method="POST" action="{{ url_for('vote') }}" onsubmit="onSubmit(event)">
+                        {% for option in options %}
+                        <label class="option">
+                            <input type="radio" name="vote" value="{{ option }}" required> {{ option }}
+                        </label>
+                        {% endfor %}
+                        <div class="actions">
+                            <button id="voteBtn" type="submit">Vote</button>
+                            <span style="margin-left:10px;" class="note">One vote per browser (optionally tied to account).</span>
+                        </div>
+                    </form>
+                {% endif %}
+                <p style="margin-top:12px;"><a href="{{ url_for('results') }}">See results</a></p>
+            </div>
+
+            <!-- Poll directory -->
+            <div class="card">
+                <p class="section-title">Available polls</p>
+                {% if polls and polls|length > 0 %}
+                    <ul class="poll-list">
+                        {% for p in polls %}
+                        <li class="poll-item">
+                            <div>
+                                <div class="poll-title">{{ p.question }}</div>
+                                <div class="poll-meta">
+                                    {{ p.options|length }} option{{ '' if (p.options|length)==1 else 's' }}
+                                    {% if p.created %} • created {{ p.created }}{% endif %}
+                                    {% if p.login_required and p.login_required != 'none' %} • requires {{ p.login_required }} login{% endif %}
+                                </div>
+                            </div>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                {% else %}
+                    <p class="note">No polls yet. Create one to get started.</p>
+                {% endif %}
+            </div>
+        </div>
     </div>
 </body>
 </html>

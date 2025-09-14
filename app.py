@@ -460,43 +460,71 @@ def login_google():
     creds = flow.run_local_server(port=8080)
     service = build('oauth2', 'v2', credentials=creds)
     user_info = service.userinfo().get().execute()
-    email = user_info.get('email', 'Unknown')
-    return f"<h2>Google login successful!</h2><p>Email: {email}</p><p><a href='/'>Back to poll</a></p>"
+    # Store user info in session
+    session['user'] = {
+        '_provider': 'google',
+        'email': user_info.get('email'),
+        'name': user_info.get('name'),
+        'sub': user_info.get('id'),
+        'picture': user_info.get('picture')
+    }
+    # Redirect to main page with welcome message
+    return redirect(url_for('index'))
 
 @app.route("/logout")
 def logout():
     session.pop("user", None)
     return redirect(url_for("index"))
 
-# --- Main web routes ---
+# --- Poll storage ---
+POLL_LIST_FILE = os.environ.get("POLL_LIST_FILE", "polls.json")
+def load_polls():
+    if os.path.exists(POLL_LIST_FILE):
+        try:
+            with open(POLL_LIST_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Cannot load poll list; starting fresh.")
+    return []
+def save_polls(polls):
+    atomic_write_json(POLL_LIST_FILE, polls)
+
+# --- Poll creation route ---
+@app.route("/create_poll", methods=["GET", "POST"])
+def create_poll():
+    if request.method == "GET":
+        return render_template("create_poll.html")
+    # POST: handle form
+    question = request.form.get("question", "").strip()
+    options = [opt.strip() for opt in request.form.getlist("options") if opt.strip()]
+    login_required = request.form.get("login_required", "none")
+    cookie_mode = request.form.get("cookie_mode", "yes")
+    if not question or len(options) < 2:
+        return "Poll must have a question and at least two non-empty options.", 400
+    poll_id = f"poll_{uuid.uuid4().hex[:8]}"
+    poll = {
+        "id": poll_id,
+        "question": question,
+        "options": options,
+        "login_required": login_required,
+        "cookie_mode": cookie_mode,
+        "created": datetime.now(timezone.utc).isoformat()
+    }
+    polls = load_polls()
+    polls.append(poll)
+    save_polls(polls)
+    return redirect(url_for("index"))
 @app.route("/")
 def index():
-    voted = request.cookies.get(f"voted_{POLL_ID}") is not None
     user = session.get("user")
-    signin_link = None
-    if not user:
-        # Provide signin_link for templates that render a simple anchor
-        token = secrets.token_urlsafe(16)
-        app_callback = _abs_url("idena_callback")
-        start = _abs_url("idena_start_session")
-        auth = _abs_url("idena_authenticate")
-        favicon = _abs_url("static", filename="favicon.ico")
-        params = {
-            "token": token,
-            "callback_url": app_callback,
-            "nonce_endpoint": start,
-            "authentication_endpoint": auth,
-            "auth_endpoint": auth,
-            "favicon_url": favicon
-        }
-        if IDENA_USE_DESKTOP:
-            q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
-            signin_link = f"dna://signin/v1?{q}"
-        else:
-            signin_link = "https://app.idena.io/dna/signin?" + urlencode(params)
-
-    return render_template("index.html", question=POLL_QUESTION, options=POLL_OPTIONS,
-                           voted=voted, user=user, signin_link=signin_link)
+    polls = load_polls()
+    voted = request.cookies.get(f"voted_{POLL_ID}")
+    return render_template("index.html", 
+                          polls=polls, 
+                          user=user, 
+                          question=POLL_QUESTION, 
+                          options=POLL_OPTIONS,
+                          voted=voted)
 
 @app.route("/vote", methods=["POST"])
 def vote():

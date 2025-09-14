@@ -1,43 +1,64 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Poll Results</title>
     <style>
-        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; margin: 2rem; }
-        .card { max-width: 560px; padding: 1.5rem; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        h1 { margin-top: 0; }
-        .row { display: flex; justify-content: space-between; padding: 0.4rem 0; border-bottom: 1px dashed #e5e7eb; }
-        .row:last-child { border-bottom: none; }
-        a { color: #2563eb; text-decoration: none; }
+        body { font-family: Arial, sans-serif; background: #f7f7fa; }
+        .container { max-width: 600px; margin: 40px auto; background: rgba(255,255,255,0.8); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); padding: 32px; }
+        h2 { text-align: center; }
+        .results-table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+        .results-table th, .results-table td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
+        .results-table th { background: #eaf1fb; }
+        .bar { 
+            display: inline-block; 
+            height: 18px; 
+            background: #4f8cff; 
+            border-radius: 8px; 
+            --bar-width-multiplier: 2.5;
+        }
+        .anomaly { color: #d9534f; font-size: 0.95em; }
+        .meta { margin-top: 24px; font-size: 0.95em; color: #666; }
     </style>
-    </head>
+</head>
 <body>
-    <div class="card">
-        <h1>Results</h1>
-        <div>
-            {% for option, count in votes.items() %}
-            <div class="row">
-                <div>{{ option }}</div>
-                <div><strong>{{ count }}</strong></div>
-            </div>
+    <div class="container">
+        <h2>{{ question }}</h2>
+        <table class="results-table">
+            <tr>
+                <th>Option</th>
+                <th>Votes</th>
+                <th>Percent</th>
+                <th></th>
+            </tr>
+            {% for r in results %}
+            <tr>
+                <td>{{ r.option }}</td>
+                <td>{{ r.count }}</td>
+                <td>{{ r.percent }}%</td>
+                <td>
+                    <span class="bar" style="width: calc({{ r.percent }} * var(--bar-width-multiplier)px);"></span>
+                </td>
+            </tr>
             {% endfor %}
-        </div>
-        <p><strong>Total:</strong> {{ total }}</p>
-        {% if anomalies and anomalies|length > 0 %}
-        <div style="margin-top:1rem;">
-            <h3 style="margin:0 0 0.3rem 0;">Anomalies ({{ anomalies|length }})</h3>
-            <ul style="padding-left:1.1rem;">
+        </table>
+        <div class="meta">
+            <strong>Total votes:</strong> {{ total_votes }}<br>
+            <strong>Chain head:</strong> {{ head_hash }}<br>
+            {% if anomalies %}
+                <strong>Anomalies:</strong>
+                <ul>
                 {% for a in anomalies %}
-                <li style="font-size:0.85rem;">
-                    {{ a.type }} – {{ a.filename }} {% if a.expected %}(expected {{ a.expected[:8] }}.. got {{ a.actual[:8] }}){% endif %}
-                </li>
+                    <li class="anomaly">{{ a.type }}: {{ a.filename }}</li>
                 {% endfor %}
-            </ul>
+        <p style="text-align:center; margin-top:32px;"><a href="{{ url_for('index') }}">Back to poll</a></p>
+            {% endif %}
+            {% if error %}
+                <div class="anomaly">Error: {{ error }}</div>
+            {% endif %}
         </div>
-        {% endif %}
-        <p><a href="{{ url_for('index') }}">Back to poll</a></p>
+        <p style="text-align:center; margin-top:32px;"><a href="/">Back to poll</a></p>
     </div>
 </body>
 </html>
