@@ -21,11 +21,13 @@ from urllib.parse import urlencode, quote_plus, urljoin
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    make_response, session, Response
+    make_response, session, Response, send_file, abort
 )
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import requests
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 import uuid
 from eth_account.messages import encode_defunct
 from eth_account import Account
@@ -35,25 +37,28 @@ import errno
 from werkzeug.routing import BuildError
 
 # --- Config & Constants ---
-load_dotenv()
-VOTE_DIR = os.getenv("VOTE_DIR", "votes")
-DB_FILE = os.getenv("DB_FILE", "votes_db.json")
-LOG_FILE = os.getenv("LOG_FILE", "votes_log.jsonl")
-LOG_STATE = os.getenv("LOG_STATE", "log_state.json")
-CHAIN_HEAD_FILE = os.getenv("CHAIN_HEAD_FILE", "chain_head.txt")
+import os
+VOTE_DIR = os.environ.get("VOTE_DIR", "votes")
+DB_FILE = os.environ.get("DB_FILE", "votes_db.json")
+LOG_FILE = os.environ.get("LOG_FILE", "votes_log.jsonl")
+LOG_STATE = os.environ.get("LOG_STATE", "log_state.json")
+CHAIN_HEAD_FILE = os.environ.get("CHAIN_HEAD_FILE", "chain_head.txt")
 
-IDENA_VERIFY_URL = os.getenv("IDENA_VERIFY_URL", "")
-IDENA_VERIFY_METHOD = os.getenv("IDENA_VERIFY_METHOD", "local").lower()
+IDENA_VERIFY_URL = os.environ.get("IDENA_VERIFY_URL", "")
+IDENA_VERIFY_METHOD = os.environ.get("IDENA_VERIFY_METHOD", "local").lower()
 
 # If set to "1" use desktop dna:// scheme, otherwise use https://app.idena.io
-IDENA_USE_DESKTOP = os.getenv("IDENA_USE_DESKTOP", "0") == "1"
+IDENA_USE_DESKTOP = os.environ.get("IDENA_USE_DESKTOP", "0") == "1"
 
 # If you’re using the web wallet, set this to your public HTTPS base (e.g., https://x.ngrok-free.app)
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-POLL_ID = os.getenv("POLL_ID", "poll_001")
-POLL_QUESTION = os.getenv("POLL_QUESTION", "Do you support this proposal?")
-POLL_OPTIONS = json.loads(os.getenv("POLL_OPTIONS_JSON", '["Yes","No","Maybe"]'))
+POLL_ID = os.environ.get("POLL_ID", "poll_001")
+POLL_QUESTION = os.environ.get("POLL_QUESTION", "Do you support this proposal?")
+POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Maybe"]'))
+# Optional Receipter integration
+RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "")
+RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
@@ -64,15 +69,7 @@ app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
 # app.config["SERVER_NAME"] = (BASE_URL.replace("https://", "").replace("http://", "") if BASE_URL else None)
 # app.config["PREFERRED_URL_SCHEME"] = "https"
 
-oauth = OAuth(app)
-if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
-    oauth.register(name='google',
-                   client_id=os.getenv("GOOGLE_CLIENT_ID"),
-                   client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-                   server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-                   client_kwargs={'scope': 'openid email profile'})
-else:
-    logging.getLogger().warning("Google OAuth not configured")
+## Google OAuth via google-auth-oauthlib will be handled in /login/google route
 
 idena_sessions = {}
 used_nonces = set()
@@ -448,20 +445,23 @@ def idena_callback():
 </body></html>"""
     return Response(html, mimetype="text/html")
 
-# --- Google OAuth login and logout endpoints ---
 @app.route("/login/google")
 def login_google():
-    redirect_uri = _abs_url("auth_google")
-    return oauth.google.authorize_redirect(redirect_uri)
-
-@app.route("/auth/google")
-def auth_google():
-    oauth.google.authorize_access_token()
-    u = oauth.google.userinfo()
-    if u:
-        u["_provider"] = "google"
-        session["user"] = u
-    return redirect(url_for("index"))
+    # Desktop OAuth flow using google-auth-oauthlib
+    SCOPES = [
+        'openid',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile'
+    ]
+    flow = InstalledAppFlow.from_client_secrets_file(
+        'client_secrets.json',
+        scopes=SCOPES
+    )
+    creds = flow.run_local_server(port=0)
+    service = build('oauth2', 'v2', credentials=creds)
+    user_info = service.userinfo().get().execute()
+    email = user_info.get('email', 'Unknown')
+    return f"<h2>Google login successful!</h2><p>Email: {email}</p><p><a href='/'>Back to poll</a></p>"
 
 @app.route("/logout")
 def logout():
@@ -550,16 +550,172 @@ def vote():
 
 @app.route("/results")
 def results():
-    counts, anomalies = rebuild_counts_and_anomalies()
-    total = sum(counts.values())
-    return render_template("result.html", votes=dict(counts), anomalies=anomalies, total=total)
+    try:
+        counts, anomalies = rebuild_counts_and_anomalies()
+        total = sum(counts.values()) or 0
+        results_list = []
+        for opt in POLL_OPTIONS:
+            c = counts.get(opt, 0)
+            pct = round((c / total * 100.0), 2) if total else 0.0
+            results_list.append({"option": opt, "count": c, "percent": pct})
+        state = _load_log_state()
+        return render_template(
+            "result.html",
+            question=POLL_QUESTION,
+            results=results_list,
+            total_votes=total,
+            anomalies=anomalies,
+            head_hash=state.get("head", ""),
+            error=None,
+        )
+    except Exception as e:
+        logger.exception("results page error")
+        return render_template(
+            "result.html",
+            question=POLL_QUESTION,
+            results=[],
+            total_votes=0,
+            anomalies=[],
+            head_hash="",
+            error=str(e),
+        ), 500
 
 @app.route("/receipt")
 def receipt():
     entry_hash = request.args.get("h","")
     idx = int(request.args.get("i",0))
+    # Try to enrich with timestamp and file id
+    ts = ""
+    file_id = ""
+    try:
+        if entry_hash:
+            for rec in iter_log_entries() or []:
+                if rec.get("entry_hash") == entry_hash:
+                    e = rec.get("entry", {})
+                    ts = e.get("timestamp", "")
+                    file_id = e.get("id") or e.get("file_hash") or ""
+                    break
+    except Exception:
+        logger.exception("receipt lookup failure")
     state = _load_log_state()
-    return render_template("receipt.html", entry_hash=entry_hash, index=idx, head=state.get("head"), poll_id=POLL_ID)
+    return render_template(
+        "receipt.html",
+        entry_hash=entry_hash,
+        index=idx,
+        head=state.get("head"),
+        poll_id=POLL_ID,
+        ts=ts,
+        file_id=file_id,
+        receipter_url=RECEIPTER_POST_URL,
+        receipter_page_url=RECEIPTER_PAGE_URL,
+    )
+
+@app.route("/download_log")
+def download_log():
+    if not os.path.exists(LOG_FILE):
+        abort(404)
+    return send_file(LOG_FILE, as_attachment=True, download_name=os.path.basename(LOG_FILE))
+
+@app.route("/download_chain_head")
+def download_chain_head():
+    if not os.path.exists(CHAIN_HEAD_FILE):
+        abort(404)
+    return send_file(CHAIN_HEAD_FILE, as_attachment=True, download_name=os.path.basename(CHAIN_HEAD_FILE))
+
+def _recompute_chain_head_until(target_index: int):
+    state_head = b""
+    found = None
+    if not os.path.exists(LOG_FILE):
+        return None, None
+    with open(LOG_FILE, "r") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            idx = rec.get("index")
+            eh = rec.get("entry_hash")
+            if not isinstance(idx, int) or not isinstance(eh, str):
+                continue
+            try:
+                ehb = bytes.fromhex(eh)
+            except Exception:
+                continue
+            nh = hashlib.sha256(state_head + ehb).hexdigest()
+            state_head = bytes.fromhex(nh)
+            if idx == target_index:
+                found = eh
+                break
+    return (state_head.hex() if state_head else None), found
+
+@app.route("/verify", methods=["POST"])
+def verify_receipt():
+    r = request.get_json(silent=True) or {}
+    entry_hash = (r.get("entry_hash") or r.get("entry") or "").strip()
+    index = r.get("index")
+    chain_head = (r.get("chain_head") or r.get("head") or "").strip()
+    file_id = (r.get("file_id") or r.get("id") or r.get("file_hash") or "").strip()
+    poll_id = (r.get("poll_id") or r.get("poll") or "").strip()
+    if poll_id and poll_id != POLL_ID:
+        return {"valid": False, "reason": "poll_id_mismatch"}, 400
+    if not entry_hash or not isinstance(index, int):
+        return {"valid": False, "reason": "missing_entry_or_index"}, 400
+    rec_ok = False
+    rec_chain = None
+    try:
+        for rec in iter_log_entries() or []:
+            if rec.get("index") == index:
+                if rec.get("entry_hash") != entry_hash:
+                    return {"valid": False, "reason": "index_entry_mismatch"}, 400
+                rec_ok = True
+                rec_chain = rec.get("chain_head")
+                break
+    except Exception:
+        logger.exception("verify: iter_log failure")
+        return {"valid": False, "reason": "log_read_error"}, 500
+    if not rec_ok:
+        return {"valid": False, "reason": "not_found"}, 404
+    recomputed_head, eh_at_idx = _recompute_chain_head_until(index)
+    if not recomputed_head or eh_at_idx != entry_hash:
+        return {"valid": False, "reason": "chain_recompute_failed"}, 400
+    if chain_head and chain_head != recomputed_head:
+        return {"valid": False, "reason": "head_mismatch"}, 400
+    if rec_chain and rec_chain != recomputed_head:
+        return {"valid": False, "reason": "record_head_mismatch"}, 400
+    file_ok = None
+    if file_id:
+        vote_path = os.path.join(VOTE_DIR, f"{file_id}.txt")
+        if os.path.exists(vote_path):
+            try:
+                with open(vote_path, "rb") as vf:
+                    data = vf.read()
+                calc = hashlib.sha256(data).hexdigest()
+                file_ok = (calc == file_id)
+            except Exception:
+                file_ok = False
+        else:
+            file_ok = False
+    return {
+        "valid": True,
+        "head": recomputed_head,
+        "file_ok": file_ok,
+        "index": index,
+        "entry_hash": entry_hash,
+    }
+
+@app.route("/api/results")
+def api_results():
+    counts, anomalies = rebuild_counts_and_anomalies()
+    total = sum(counts.values())
+    return {
+        "poll_id": POLL_ID,
+        "question": POLL_QUESTION,
+        "options": POLL_OPTIONS,
+        "counts": counts,
+        "total": total,
+        "anomalies": anomalies,
+        "head": _load_log_state().get("head"),
+    }
 
 @app.route("/_internal/status")
 def status():
