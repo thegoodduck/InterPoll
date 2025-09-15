@@ -1,0 +1,15 @@
+{
+  "votes": {
+    "7012534aa2fdef27839d1a2eebbfe3e4c100c743b1b2ec5c0326528c91d92a63": {
+      "choice": "Nope",
+      "timestamp": "2025-09-15T23:37:46.592716+00:00",
+      "ip": "127.0.0.1",
+      "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      "identity": ""
+    }
+  },
+  "counts": {
+    "Nope": 1,
+    "Yope": 0
+  }
+}

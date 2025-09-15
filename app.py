@@ -489,6 +489,123 @@ def load_polls():
 def save_polls(polls):
     atomic_write_json(POLL_LIST_FILE, polls)
 
+# --- Per-poll helpers (shareable poll pages) ---
+def get_poll(poll_id: str):
+    for p in load_polls():
+        if p.get("id") == poll_id:
+            return p
+    return None
+
+def _paths_for_poll(poll_id: str):
+    base_votes_dir = os.path.join(VOTE_DIR, poll_id)
+    os.makedirs(base_votes_dir, exist_ok=True)
+    db = f"votes_db_{poll_id}.json"
+    log = f"votes_log_{poll_id}.jsonl"
+    state = f"log_state_{poll_id}.json"
+    head = f"chain_head_{poll_id}.txt"
+    return {
+        "VOTE_DIR": base_votes_dir,
+        "DB_FILE": os.path.join(base_votes_dir, db),
+        "LOG_FILE": os.path.join(base_votes_dir, log),
+        "LOG_STATE": os.path.join(base_votes_dir, state),
+        "CHAIN_HEAD_FILE": os.path.join(base_votes_dir, head),
+    }
+
+def _load_db_for_poll(poll_id: str, options: list[str]):
+    paths = _paths_for_poll(poll_id)
+    if os.path.exists(paths["DB_FILE"]):
+        try:
+            with open(paths["DB_FILE"], "r") as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Cannot load DB for %s; starting fresh.", poll_id)
+    return {"votes": {}, "counts": {opt: 0 for opt in options}}
+
+def _save_db_for_poll(poll_id: str, db_obj: dict):
+    paths = _paths_for_poll(poll_id)
+    with FileLock(paths["DB_FILE"] + ".lock"):
+        atomic_write_json(paths["DB_FILE"], db_obj)
+
+def _append_log_for_poll(poll_id: str, entry: dict):
+    paths = _paths_for_poll(poll_id)
+    # Per-poll transparency log
+    if os.path.exists(paths["LOG_STATE"]):
+        try:
+            with open(paths["LOG_STATE"], "r") as f:
+                state = json.load(f)
+        except Exception:
+            state = {"count":0, "head":""}
+    else:
+        state = {"count":0, "head":""}
+    prev = bytes.fromhex(state.get("head","")) if state.get("head") else b""
+    ej = _canonical_json(entry)
+    eh = _sha256_hex(ej.encode())
+    nh = _sha256_hex(prev + bytes.fromhex(eh))
+    idx = state.get("count", 0)
+    rec = {"index": idx, "entry": entry, "entry_hash": eh, "chain_head": nh}
+    with FileLock(paths["LOG_FILE"] + ".lock"):
+        with open(paths["LOG_FILE"], "a") as f:
+            f.write(_canonical_json(rec) + "\n")
+        state["count"] = idx + 1
+        state["head"] = nh
+        with FileLock(paths["LOG_STATE"] + ".lock"):
+            atomic_write_json(paths["LOG_STATE"], state)
+        atomic_write_text(paths["CHAIN_HEAD_FILE"], f"poll={poll_id}\nindex={idx}\nhead={nh}\n")
+    try:
+        subprocess.run(["ots", "stamp", paths["CHAIN_HEAD_FILE"]], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        logger.debug("ots not installed")
+    except Exception as e:
+        logger.warning("ots error: %s", e)
+    return eh, nh, idx
+
+def _iter_log_entries_for_poll(poll_id: str):
+    paths = _paths_for_poll(poll_id)
+    lf = paths["LOG_FILE"]
+    if not os.path.exists(lf):
+        return
+    with open(lf) as f:
+        for line in f:
+            try:
+                yield json.loads(line)
+            except Exception:
+                logger.exception("bad log entry (%s)", poll_id)
+                continue
+
+def _rebuild_counts_for_poll(poll_id: str, options: list[str]):
+    paths = _paths_for_poll(poll_id)
+    counts = Counter({opt:0 for opt in options})
+    anomalies = []
+    for rec in _iter_log_entries_for_poll(poll_id) or []:
+        e = rec.get("entry",{})
+        c = e.get("choice")
+        if c in counts:
+            counts[c] += 1
+        fn = e.get("filename") or f"{e.get('id','')}.txt"
+        fh = e.get("file_hash") or e.get("id")
+        p = os.path.join(paths["VOTE_DIR"], fn)
+        if not os.path.exists(p):
+            anomalies.append({"type": "missing_file", "filename": fn})
+            continue
+        try:
+            with open(p, "rb") as vf:
+                data_bytes = vf.read()
+            a = hashlib.sha256(data_bytes).hexdigest()
+            if fh and a != fh:
+                anomalies.append({"type": "hash_mismatch", "filename": fn})
+        except Exception as ex:
+            anomalies.append({"type": "read_error", "filename": fn, "error": str(ex)})
+    # load state
+    head = ""
+    st_path = _paths_for_poll(poll_id)["LOG_STATE"]
+    if os.path.exists(st_path):
+        try:
+            with open(st_path, "r") as f:
+                head = (json.load(f) or {}).get("head", "")
+        except Exception:
+            head = ""
+    return counts, anomalies, head
+
 # --- Poll creation route ---
 @app.route("/create_poll", methods=["GET", "POST"])
 def create_poll():
@@ -514,6 +631,168 @@ def create_poll():
     polls.append(poll)
     save_polls(polls)
     return redirect(url_for("index"))
+
+# --- Per-poll pages ---
+@app.route("/poll/<poll_id>")
+def poll_detail(poll_id):
+    user = session.get("user")
+    p = get_poll(poll_id)
+    if not p:
+        abort(404)
+    voted = request.cookies.get(f"voted_{poll_id}")
+    return render_template(
+        "poll_detail.html",
+        poll=p,
+        user=user,
+        voted=voted,
+    )
+
+@app.route("/poll/<poll_id>/vote", methods=["POST"])
+def poll_vote(poll_id):
+    p = get_poll(poll_id)
+    if not p:
+        abort(404)
+    choice = request.form.get("vote")
+    options = p.get("options") or []
+    if choice not in options:
+        return "Invalid vote option!", 400
+    cookie_key = f"voted_{poll_id}"
+    user = session.get("user") or {}
+    provider = user.get("_provider")
+    identity = (f"idena:{user['address']}" if provider=="idena"
+                else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
+    db = _load_db_for_poll(poll_id, options)
+    if identity:
+        if any(v.get("identity")==identity for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id))
+    if request.cookies.get(cookie_key):
+        return redirect(url_for("poll_results", poll_id=poll_id))
+    ts = datetime.now(timezone.utc).isoformat()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = (request.headers.get("User-Agent","") or "")[:400]
+    vote_data = f"{choice}|{ts}|{ip}|{ua}|{identity}"
+    file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
+    vote_dir = _paths_for_poll(poll_id)["VOTE_DIR"]
+    os.makedirs(vote_dir, exist_ok=True)
+    fn = os.path.join(vote_dir, f"{file_hash}.txt")
+    try:
+        atomic_write_text(fn, vote_data)
+    except Exception:
+        logger.exception("Vote file error")
+        return "Error saving vote", 500
+    try:
+        subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "ip":ip, "ua":ua, "identity":identity}
+    db["counts"].setdefault(choice, 0)
+    db["counts"][choice] += 1
+    try:
+        _save_db_for_poll(poll_id, db)
+    except Exception:
+        logger.exception("save_db error")
+    entry = {"poll":poll_id,"choice":choice,"timestamp":ts,"id":file_hash,
+             "identity":identity,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
+    try:
+        eh, _chain_head, idx = _append_log_for_poll(poll_id, entry)
+    except Exception:
+        logger.exception("log append error")
+        eh, idx = None, 0
+    resp = make_response(redirect(url_for("poll_receipt", poll_id=poll_id, h=(eh or ""), i=idx)))
+    secure = os.getenv("PRODUCTION","").lower() in ("1","true")
+    resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
+    return resp
+
+@app.route("/poll/<poll_id>/results")
+def poll_results(poll_id):
+    p = get_poll(poll_id)
+    if not p:
+        abort(404)
+    try:
+        counts, anomalies, head = _rebuild_counts_for_poll(poll_id, p.get("options") or [])
+        total = sum(counts.values()) or 0
+        results_list = []
+        for opt in p.get("options") or []:
+            c = counts.get(opt, 0)
+            pct = round((c / total * 100.0), 2) if total else 0.0
+            results_list.append({"option": opt, "count": c, "percent": pct})
+        return render_template(
+            "result.html",
+            question=p.get("question"),
+            results=results_list,
+            total_votes=total,
+            anomalies=anomalies,
+            head_hash=head,
+            error=None,
+        )
+    except Exception as e:
+        logger.exception("poll results error")
+        return render_template(
+            "result.html",
+            question=p.get("question"),
+            results=[],
+            total_votes=0,
+            anomalies=[],
+            head_hash="",
+            error=str(e),
+        ), 500
+
+@app.route("/poll/<poll_id>/receipt")
+def poll_receipt(poll_id):
+    entry_hash = request.args.get("h","")
+    idx = int(request.args.get("i",0))
+    ts = ""
+    file_id = ""
+    try:
+        for rec in _iter_log_entries_for_poll(poll_id) or []:
+            if rec.get("index") == idx:
+                e = rec.get("entry", {})
+                if entry_hash and rec.get("entry_hash") != entry_hash:
+                    continue
+                ts = e.get("timestamp", "")
+                file_id = e.get("id") or e.get("file_hash") or ""
+                break
+    except Exception:
+        logger.exception("poll receipt lookup failure")
+    # head
+    head = ""
+    st_path = _paths_for_poll(poll_id)["LOG_STATE"]
+    if os.path.exists(st_path):
+        try:
+            with open(st_path, "r") as f:
+                head = (json.load(f) or {}).get("head", "")
+        except Exception:
+            pass
+    return render_template(
+        "receipt.html",
+        entry_hash=entry_hash,
+        index=idx,
+        head=head,
+        poll_id=poll_id,
+        ts=ts,
+        file_id=file_id,
+        receipter_url=RECEIPTER_POST_URL,
+        receipter_page_url=RECEIPTER_PAGE_URL,
+        back_url=url_for('poll_detail', poll_id=poll_id),
+        results_url=url_for('poll_results', poll_id=poll_id),
+        download_log_url=url_for('poll_download_log', poll_id=poll_id),
+        download_head_url=url_for('poll_download_chain_head', poll_id=poll_id),
+    )
+
+@app.route("/poll/<poll_id>/download_log")
+def poll_download_log(poll_id):
+    lf = _paths_for_poll(poll_id)["LOG_FILE"]
+    if not os.path.exists(lf):
+        abort(404)
+    return send_file(lf, as_attachment=True, download_name=os.path.basename(lf))
+
+@app.route("/poll/<poll_id>/download_chain_head")
+def poll_download_chain_head(poll_id):
+    hf = _paths_for_poll(poll_id)["CHAIN_HEAD_FILE"]
+    if not os.path.exists(hf):
+        abort(404)
+    return send_file(hf, as_attachment=True, download_name=os.path.basename(hf))
+
 @app.route("/")
 def index():
     user = session.get("user")
@@ -636,6 +915,10 @@ def receipt():
         file_id=file_id,
         receipter_url=RECEIPTER_POST_URL,
         receipter_page_url=RECEIPTER_PAGE_URL,
+        back_url=url_for('index'),
+        results_url=url_for('results'),
+        download_log_url=url_for('download_log'),
+        download_head_url=url_for('download_chain_head'),
     )
 
 @app.route("/download_log")

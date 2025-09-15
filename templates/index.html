@@ -130,50 +130,30 @@
                         via <strong>{{ user._provider }}</strong>
                         · <a href="{{ url_for('logout') }}">Logout</a>
                     </p>
+                    <p class="note">Sign-in is optional — you can vote with or without an account.</p>
                 {% else %}
-                    <p class="status">Optional sign-in: 
-                        <a href="{{ url_for('login_google') }}">Google</a> · 
-                        <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>
+                    <p class="status">Sign-in is optional — you can vote without an account. If you prefer, sign in with 
+                        <a href="{{ url_for('login_google') }}">Google</a> or 
+                        <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>.
                     </p>
                 {% endif %}
             </div>
 
-            <!-- Current poll card -->
-            <div class="card">
-                <p class="section-title">Current poll</p>
-                <h2 style="margin:6px 0 12px 0;">{{ question }}</h2>
-                {% if voted %}
-                    <p class="success">Thanks, your vote was recorded. You can see live results below.</p>
-                {% else %}
-                    <form method="POST" action="{{ url_for('vote') }}" onsubmit="onSubmit(event)">
-                        {% for option in options %}
-                        <label class="option">
-                            <input type="radio" name="vote" value="{{ option }}" required> {{ option }}
-                        </label>
-                        {% endfor %}
-                        <div class="actions">
-                            <button id="voteBtn" type="submit">Vote</button>
-                            <span style="margin-left:10px;" class="note">One vote per browser (optionally tied to account).</span>
-                        </div>
-                    </form>
-                {% endif %}
-                <p style="margin-top:12px;"><a href="{{ url_for('results') }}">See results</a></p>
-            </div>
-
-            <!-- Poll directory -->
+            <!-- Poll directory only, with search -->
             <div class="card">
                 <p class="section-title">Available polls</p>
+                <input id="search" type="search" placeholder="Search polls…" style="width:100%;padding:10px;border-radius:10px;border:1px solid #e5e7eb" oninput="filterPolls()" />
                 {% if polls and polls|length > 0 %}
-                    <ul class="poll-list">
+                    <ul id="pollList" class="poll-list">
                         {% for p in polls %}
-                        <li class="poll-item">
+                        <li class="poll-item" data-title="{{ p.question|lower }}">
                             <div>
-                                <div class="poll-title">{{ p.question }}</div>
+                                <div class="poll-title"><a href="{{ url_for('poll_detail', poll_id=p.id) }}">{{ p.question }}</a></div>
                                 <div class="poll-meta">
                                     {{ p.options|length }} option{{ '' if (p.options|length)==1 else 's' }}
                                     {% if p.created %} • created {{ p.created }}{% endif %}
-                                    {% if p.login_required and p.login_required != 'none' %} • requires {{ p.login_required }} login{% endif %}
                                 </div>
+                                <div class="poll-meta"><a href="{{ url_for('poll_results', poll_id=p.id) }}">Results</a> • Share: <code>{{ request.host_url.rstrip('/') }}{{ url_for('poll_detail', poll_id=p.id) }}</code></div>
                             </div>
                         </li>
                         {% endfor %}
@@ -184,5 +164,15 @@
             </div>
         </div>
     </div>
+    <script>
+      function filterPolls(){
+        const q = (document.getElementById('search').value || '').toLowerCase();
+        const items = document.querySelectorAll('#pollList .poll-item');
+        items.forEach(li => {
+          const t = li.getAttribute('data-title') || '';
+          li.style.display = (!q || t.includes(q)) ? '' : 'none';
+        });
+      }
+    </script>
 </body>
 </html>

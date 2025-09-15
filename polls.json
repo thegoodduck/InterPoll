@@ -9,5 +9,27 @@
     "login_required": "none",
     "cookie_mode": "yes",
     "created": "2025-09-14T23:44:47.227823+00:00"
+  },
+  {
+    "id": "poll_d1c0dce9",
+    "question": "Hu",
+    "options": [
+      "Nope",
+      "Yope"
+    ],
+    "login_required": "google",
+    "cookie_mode": "yes",
+    "created": "2025-09-15T23:37:35.032880+00:00"
+  },
+  {
+    "id": "poll_de14ad0e",
+    "question": "Are you acceptant",
+    "options": [
+      "Yes",
+      "No"
+    ],
+    "login_required": "google",
+    "cookie_mode": "yes",
+    "created": "2025-09-15T23:43:51.458248+00:00"
   }
 ]

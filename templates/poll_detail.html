@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ poll.question }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; background:#f8fafc; }
+    .shell { max-width: 680px; margin: 32px auto; padding: 0 16px; }
+    .card { background: #fff; border:1px solid #e5e7eb; border-radius: 14px; box-shadow:0 2px 8px rgba(0,0,0,.05); padding: 18px; }
+    .option { display:block; margin: 8px 0; }
+    .actions { margin-top: 12px; }
+    button { padding: 8px 12px; border-radius: 10px; border:1px solid #2563eb; background:#2563eb; color:#fff; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="card">
+      <h2 style="margin:0 0 10px 0;">{{ poll.question }}</h2>
+      {% if voted %}
+        <p>Thanks, your vote was recorded. <a href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>.</p>
+      {% else %}
+        <form method="POST" action="{{ url_for('poll_vote', poll_id=poll.id) }}">
+          {% for opt in poll.options %}
+          <label class="option">
+            <input type="radio" name="vote" value="{{ opt }}" required /> {{ opt }}
+          </label>
+          {% endfor %}
+          <div class="actions">
+            <button type="submit">Vote</button>
+            <a style="margin-left:10px" href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>
+          </div>
+        </form>
+      {% endif %}
+      <p style="margin-top:14px"><a href="{{ url_for('index') }}">All polls</a></p>
+    </div>
+  </div>
+</body>
+</html>

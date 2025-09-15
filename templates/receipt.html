@@ -51,7 +51,11 @@
 
         async function sendToReceipter() {
             const receipterUrl = '{{ receipter_url }}';
-            if (!receipterUrl) { alert('Receipter URL not configured.'); return; }
+            if (!receipterUrl) { 
+                const status = document.getElementById('receipterStatus');
+                if (status) { status.textContent = 'Receipter not configured.'; status.style.color = '#6b7280'; }
+                return; 
+            }
             const r = makeReceipt();
             const status = document.getElementById('receipterStatus');
             if (status) { status.textContent = 'Sending receipt to Receipter…'; status.style.color = '#6b7280'; }
@@ -68,14 +72,31 @@
 
         function openReceipterWithHash(){
             const page = '{{ receipter_page_url }}';
-            if (!page) { alert('Receipter page URL not configured.'); return; }
+            if (!page) { 
+                const status = document.getElementById('receipterStatus');
+                if (status) { status.textContent = 'Receipter page URL not configured.'; status.style.color = '#6b7280'; }
+                return; 
+            }
             const r = makeReceipt();
             const encoded = encodeURIComponent(btoa(JSON.stringify(r)));
             window.open(page + '#r=' + encoded, '_blank');
         }
         // Auto attempt to send to Receipter on load (non-blocking)
         document.addEventListener('DOMContentLoaded', () => {
-            if (document.getElementById('autoSendToggle')?.checked) {
+            const hasReceipter = !!'{{ receipter_url }}';
+            const hasReceipterPage = !!'{{ receipter_page_url }}';
+            const btnSend = document.getElementById('btnSendReceipter');
+            const btnOpen = document.getElementById('btnOpenReceipter');
+            const autoWrap = document.getElementById('autoSendWrap');
+            if (!hasReceipter) {
+                if (btnSend) btnSend.style.display = 'none';
+                if (autoWrap) { autoWrap.style.display = 'none'; const t = document.getElementById('autoSendToggle'); if (t) t.checked=false; }
+                const status = document.getElementById('receipterStatus');
+                if (status) { status.textContent = 'Receipter integration disabled.'; status.style.color = '#6b7280'; }
+            }
+            if (!hasReceipterPage && btnOpen) btnOpen.style.display = 'none';
+            // Only auto-send if configured and enabled
+            if (hasReceipter && document.getElementById('autoSendToggle')?.checked) {
                 sendToReceipter();
             }
         });
@@ -93,9 +114,9 @@
         <p>
             <button onclick="saveLocal()">Save to this browser</button>
             <button onclick="downloadReceipt()">Download JSON</button>
-            <button onclick="sendToReceipter()">Send to Receipter</button>
-            <button onclick="openReceipterWithHash()">Open Receipter (auto-import)</button>
-            <label style="margin-left:0.5rem;font-size:0.85rem;">
+            <button id="btnSendReceipter" onclick="sendToReceipter()">Send to Receipter</button>
+            <button id="btnOpenReceipter" onclick="openReceipterWithHash()">Open Receipter (auto-import)</button>
+            <label id="autoSendWrap" style="margin-left:0.5rem;font-size:0.85rem;">
                 <input type="checkbox" id="autoSendToggle" checked> auto-send
             </label>
         </p>
@@ -103,16 +124,16 @@
 
         <h3>Verify</h3>
         <ol>
-            <li>Download the transparency log: <a href="{{ url_for('download_log') }}">votes_log.jsonl</a> and search for your <code>entry_hash</code>.</li>
+            <li>Download the transparency log: <a href="{{ download_log_url or url_for('download_log') }}">votes_log.jsonl</a> and search for your <code>entry_hash</code>.</li>
             <li>
-                Download the latest chain head file: <a href="{{ url_for('download_chain_head') }}">chain_head.txt</a>.
+                Download the latest chain head file: <a href="{{ download_head_url or url_for('download_chain_head') }}">chain_head.txt</a>.
                 If you have the OpenTimestamps CLI, you can verify the timestamp of the chain head locally.
             </li>
         </ol>
 
         <p>
-            <a href="{{ url_for('results') }}">See results</a> ·
-            <a href="{{ url_for('index') }}">Back to poll</a> ·
+            <a href="{{ results_url or url_for('results') }}">See results</a> ·
+            <a href="{{ back_url or url_for('index') }}">Back to poll</a> ·
             <a href="{{ receipter_page_url }}" target="_blank">Open Receipter</a>
         </p>
     </div>

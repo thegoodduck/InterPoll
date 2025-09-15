@@ -1,0 +1,15 @@
+{
+  "votes": {
+    "28bac8bce1c51f5338ff1516d3230d16ab40004cfb1e3a1b29fa95c402985d60": {
+      "choice": "ere",
+      "timestamp": "2025-09-15T23:35:17.297319+00:00",
+      "ip": "127.0.0.1",
+      "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      "identity": ""
+    }
+  },
+  "counts": {
+    "ere": 1,
+    "wewwe": 0
+  }
+}
