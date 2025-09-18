@@ -107,11 +107,24 @@ def ingest():
     if any(r.get('entry_hash') == eh for r in receipts):
         return _corsify(jsonify({"ok": True, "status": "duplicate"}))
 
+    # Optional user scoping
+    uid = data.get("user_id")
+    if uid is not None and not isinstance(uid, str):
+        return _corsify(jsonify({"ok": False, "error": "bad user_id"})), 400
     data["received_at"] = datetime.now(timezone.utc).isoformat()
     data["verified"] = _verify_against_chain(data)
     receipts.append(data)
     save()
     return _corsify(jsonify({"ok": True, "verified": data["verified"]}))
+
+@app.route('/mine')
+def mine():
+    uid = (request.args.get('uid') or '').strip()
+    if not uid:
+        # no uid -> show empty
+        return render_template('home.html', count=0, receipts=[])
+    mine = [r for r in receipts if (r.get('user_id') or '') == uid]
+    return render_template('home.html', count=len(mine), receipts=mine[-50:][::-1])
 
 if __name__ == '__main__':
     app.run(port=7001, debug=True)

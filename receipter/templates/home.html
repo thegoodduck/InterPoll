@@ -15,6 +15,10 @@
   <div class="card">
     <h1>Receipter</h1>
     <p>Stored receipts: <strong>{{ count }}</strong></p>
+    <h3>Recover my receipts</h3>
+    <p>Paste your 12-word recovery phrase to view your receipts stored on this server.</p>
+    <textarea id="mn" rows="2" style="width:100%;" placeholder="twelve words..."></textarea>
+    <p><button onclick="recoverMine()">View my receipts</button></p>
     <p>To add a receipt, the main app will POST JSON to <code>/ingest</code>. You can also paste JSON below:</p>
     <textarea id="txt" rows="8" style="width:100%;"></textarea>
     <p><button onclick="submitJson()">Submit JSON</button></p>
@@ -33,6 +37,18 @@
     {% endfor %}
   </div>
   <script>
+    async function sha256Hex(str){
+      const enc = new TextEncoder().encode((str||'').trim().toLowerCase().split(/\s+/).join(' '))
+      const digest = await crypto.subtle.digest('SHA-256', enc)
+      const bytes = Array.from(new Uint8Array(digest))
+      return bytes.map(b=>b.toString(16).padStart(2,'0')).join('')
+    }
+    async function recoverMine(){
+      const phrase = document.getElementById('mn').value || ''
+      if(!phrase.trim()) { alert('Enter your 12 words'); return }
+      const uid = await sha256Hex(phrase)
+      location.href = '/mine?uid=' + encodeURIComponent(uid)
+    }
     async function submitJson(){
       try {
         const parsed = JSON.parse(document.getElementById('txt').value)

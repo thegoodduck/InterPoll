@@ -1,0 +1,3 @@
+poll=poll_de14ad0e
+index=0
+head=8adbf351211ebba467777994ae7beb08fce0ec3ac3b0b2ad553741915744661d

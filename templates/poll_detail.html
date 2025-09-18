@@ -21,6 +21,22 @@
       {% if voted %}
         <p>Thanks, your vote was recorded. <a href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>.</p>
       {% else %}
+        {% if not can_vote %}
+          {% set req = (poll.login_required or 'none')|lower %}
+          <div style="margin:10px 0; color:#b45309;">
+            {% if req == 'google' %}
+              This poll requires Google sign-in.
+              <a href="{{ url_for('login_google') }}">Sign in with Google</a>
+            {% elif req == 'idena' %}
+              This poll requires Idena sign-in.
+              <a href="{{ url_for('login_idena') }}">Sign in with Idena</a>
+            {% elif req == 'any' %}
+              This poll requires sign-in.
+              <a href="{{ url_for('login_google') }}">Google</a> ·
+              <a href="{{ url_for('login_idena') }}">Idena</a>
+            {% endif %}
+          </div>
+        {% else %}
         <form method="POST" action="{{ url_for('poll_vote', poll_id=poll.id) }}">
           {% for opt in poll.options %}
           <label class="option">
@@ -32,6 +48,7 @@
             <a style="margin-left:10px" href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>
           </div>
         </form>
+        {% endif %}
       {% endif %}
       <p style="margin-top:14px"><a href="{{ url_for('index') }}">All polls</a></p>
     </div>

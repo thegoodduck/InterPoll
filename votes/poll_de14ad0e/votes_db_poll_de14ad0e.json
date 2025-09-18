@@ -1,0 +1,13 @@
+{
+  "votes": {
+    "9dc6d7887baf64ec70f84683b065ba5e0589c177c7912f9439dab7d6f5a51f98": {
+      "choice": "Yes",
+      "timestamp": "2025-09-18T23:24:00.201033+00:00",
+      "identity": ""
+    }
+  },
+  "counts": {
+    "Yes": 1,
+    "No": 0
+  }
+}

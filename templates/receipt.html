@@ -12,6 +12,43 @@
         .row { margin: 0.5rem 0; }
     </style>
     <script>
+        // Minimal 256-word list for mnemonic-like phrase (not BIP39)
+        const WORDS = [
+          'apple','angle','art','atom','aqua','award','axis','azure','baby','bacon','badge','ballet','bamboo','banana','basic','beach','beam','beard','beauty','beaver','become','beef','begin','behave','being','believe','bell','bench','benefit','berry','beyond','bicycle','bid','big','bike','bird','birth','bison','bitter','black','blade','blame','blank','blast','blaze','bleak','blend','bless','blind','blink','block','blonde','blood','bloom','blue','bluff','board','boat','body','boil','bold','bolt','bomb','bond','bone','bonus','book','boost','border','bore','born','boss','both','bother','bottle','bottom','bounce','box','boy','brain','brand','brave','bread','break','breeze','brick','bridge','brief','bright','bring','broad','broken','bronze','broom','brown','brush','bubble','buddy','budget','buffalo','build','bulb','bulk','bullet','bundle','bunker','burden','burger','burst','bus','bush','business','busy','butter','buyer','cabin','cable','cactus','cake','calm','camera','camp','canal','candy','canoe','canvas','canyon','capital','captain','car','carbon','card','career','cargo','carpet','carry','cart','case','cash','casino','castle','casual','cat','catalog','catch','cattle','cause','cave','ceiling','celery','cement','census','century','cereal','certain','chain','chair','chalk','champion','change','chaos','charge','charm','chart','check','cheese','chef','cherry','chest','chicken','chief','child','chimney','choice','choose','chop','chorus','circle','city','civil','claim','clap','clarify','clay','clean','clerk','clever','click','client','cliff','climb','clinic','clip','clock','close','cloth','cloud','clown','club','clue','cluster','coach','coal','coast','coconut','code','coffee','coin','cold','collar','color','column','combine','come','comfort','comic','common','company','concert','conduct','confirm','connect','consider','control','cookie','cool','copper','copy','coral','core','corn','correct','cost','cotton','couch','country','couple','course','cousin','cover','coyote','crack','craft','crane','crash','crater','crawl','crazy','cream','credit','creek','crew','cricket','crime','crisp','critic','crop','cross','crouch','crowd','cruise','crumble','crystal','cube','culture','cup','curious','current','curtain','curve','cushion','custom','cute','cycle'
+        ];
+
+        function normalizePhrase(s){
+            return (s || '').trim().toLowerCase().split(/\s+/).join(' ');
+        }
+
+        function ensureMnemonic(){
+            let m = localStorage.getItem('interpoll_mnemonic') || '';
+            m = normalizePhrase(m);
+            if (!m) {
+                const arr = [];
+                const cryptoObj = window.crypto || window.msCrypto;
+                const buf = new Uint32Array(12);
+                cryptoObj.getRandomValues(buf);
+                for (let i=0;i<12;i++) arr.push(WORDS[buf[i] % WORDS.length]);
+                m = arr.join(' ');
+                localStorage.setItem('interpoll_mnemonic', m);
+            }
+            return m;
+        }
+
+        async function sha256Hex(str){
+            const enc = new TextEncoder().encode(str);
+            const digest = await crypto.subtle.digest('SHA-256', enc);
+            const bytes = Array.from(new Uint8Array(digest));
+            return bytes.map(b => b.toString(16).padStart(2,'0')).join('');
+        }
+
+        async function getUserId(){
+            const mn = ensureMnemonic();
+            const uid = await sha256Hex(mn);
+            return { uid, mnemonic: mn };
+        }
+
         function makeReceipt() {
             const el = document.getElementById('rcpt');
             return {
@@ -57,6 +94,10 @@
                 return; 
             }
             const r = makeReceipt();
+            try {
+                const { uid } = await getUserId();
+                r.user_id = uid;
+            } catch(e) {}
             const status = document.getElementById('receipterStatus');
             if (status) { status.textContent = 'Sending receipt to Receipter…'; status.style.color = '#6b7280'; }
             try {
@@ -70,7 +111,7 @@
             }
         }
 
-        function openReceipterWithHash(){
+        async function openReceipterWithHash(){
             const page = '{{ receipter_page_url }}';
             if (!page) { 
                 const status = document.getElementById('receipterStatus');
@@ -78,6 +119,10 @@
                 return; 
             }
             const r = makeReceipt();
+            try {
+                const { uid } = await getUserId();
+                r.user_id = uid;
+            } catch(e) {}
             const encoded = encodeURIComponent(btoa(JSON.stringify(r)));
             window.open(page + '#r=' + encoded, '_blank');
         }
@@ -95,6 +140,12 @@
                 if (status) { status.textContent = 'Receipter integration disabled.'; status.style.color = '#6b7280'; }
             }
             if (!hasReceipterPage && btnOpen) btnOpen.style.display = 'none';
+            // Show or generate mnemonic
+            try {
+                const m = ensureMnemonic();
+                const mnEl = document.getElementById('mnemonic');
+                if (mnEl) mnEl.textContent = m;
+            } catch(e) {}
             // Only auto-send if configured and enabled
             if (hasReceipter && document.getElementById('autoSendToggle')?.checked) {
                 sendToReceipter();
@@ -121,6 +172,13 @@
             </label>
         </p>
         <div id="receipterStatus" style="font-size:0.9rem;margin-top:0.25rem;color:#6b7280;">Auto-sending…</div>
+
+                <h3>Your recovery phrase</h3>
+                <p>These 12 words identify you for Receipter. Save them to recover all your receipts on any Receipter server:</p>
+                <p style="background:#f8fafc;border:1px dashed #cbd5e1;padding:10px;border-radius:8px;">
+                    <code id="mnemonic" style="font-size:0.95rem"></code>
+                </p>
+                <p class="note" style="color:#6b7280;font-size:0.9rem;">Anyone with this phrase can fetch the list of your receipts. Do not share it unless you understand the privacy implications.</p>
 
         <h3>Verify</h3>
         <ol>

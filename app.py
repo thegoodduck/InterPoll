@@ -56,9 +56,9 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 POLL_ID = os.environ.get("POLL_ID", "poll_001")
 POLL_QUESTION = os.environ.get("POLL_QUESTION", "Do you support this proposal?")
 POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Maybe"]'))
-# Optional Receipter integration
-RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "")
-RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "")
+# Optional Receipter integration (defaults to local receipter)
+RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "http://localhost:7001/ingest")
+RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "http://localhost:7001/")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
@@ -79,6 +79,25 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# --- Auth helpers for per-poll login requirements ---
+def _current_provider() -> str:
+    u = session.get("user") or {}
+    p = (u.get("_provider") or "").lower()
+    return p
+
+def _login_ok_for_poll(poll: dict) -> bool:
+    req = (poll.get("login_required") or "none").lower()
+    prov = _current_provider()
+    if req in ("", "none"):
+        return True
+    if req == "google":
+        return prov == "google"
+    if req == "idena":
+        return prov == "idena"
+    if req == "any":
+        return prov in ("google", "idena")
+    return True
 
 # --- Helpers for absolute URLs ---
 def _abs_url(path_endpoint_name: str, **values) -> str:
@@ -144,6 +163,20 @@ if os.path.exists(DB_FILE):
         votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
 else:
     votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
+
+# On load, scrub legacy fingerprinting fields from global DB
+try:
+    changed = False
+    for k, v in list(votes_db.get("votes", {}).items()):
+        if isinstance(v, dict):
+            if "ip" in v:
+                v.pop("ip", None); changed = True
+            if "ua" in v:
+                v.pop("ua", None); changed = True
+    if changed:
+        save_db()
+except Exception:
+    logger.exception("Failed to sanitize global DB")
 
 def save_db():
     with FileLock(DB_FILE + ".lock"):
@@ -468,7 +501,10 @@ def login_google():
         'sub': user_info.get('id'),
         'picture': user_info.get('picture')
     }
-    # Redirect to main page with welcome message
+    # Redirect back if we were enforcing login for a poll
+    nxt = session.pop('_next', None)
+    if nxt:
+        return redirect(nxt)
     return redirect(url_for('index'))
 
 @app.route("/logout")
@@ -516,7 +552,21 @@ def _load_db_for_poll(poll_id: str, options: list[str]):
     if os.path.exists(paths["DB_FILE"]):
         try:
             with open(paths["DB_FILE"], "r") as f:
-                return json.load(f)
+                db = json.load(f)
+            # Scrub legacy fingerprinting fields from per-poll DB
+            changed = False
+            for _k, v in list((db.get("votes") or {}).items()):
+                if isinstance(v, dict):
+                    if "ip" in v:
+                        v.pop("ip", None); changed = True
+                    if "ua" in v:
+                        v.pop("ua", None); changed = True
+            if changed:
+                try:
+                    _save_db_for_poll(poll_id, db)
+                except Exception:
+                    logger.exception("Failed to sanitize DB for %s", poll_id)
+            return db
         except Exception:
             logger.exception("Cannot load DB for %s; starting fresh.", poll_id)
     return {"votes": {}, "counts": {opt: 0 for opt in options}}
@@ -640,11 +690,13 @@ def poll_detail(poll_id):
     if not p:
         abort(404)
     voted = request.cookies.get(f"voted_{poll_id}")
+    can_vote = _login_ok_for_poll(p)
     return render_template(
         "poll_detail.html",
         poll=p,
         user=user,
         voted=voted,
+        can_vote=can_vote,
     )
 
 @app.route("/poll/<poll_id>/vote", methods=["POST"])
@@ -652,6 +704,17 @@ def poll_vote(poll_id):
     p = get_poll(poll_id)
     if not p:
         abort(404)
+    # Enforce per-poll login requirement
+    if not _login_ok_for_poll(p):
+        req = (p.get("login_required") or "none").lower()
+        if req == "google":
+            # best-effort next handling via session
+            session["_next"] = url_for("poll_detail", poll_id=poll_id)
+            return redirect(url_for("login_google"))
+        if req == "idena":
+            session["_next"] = url_for("poll_detail", poll_id=poll_id)
+            return redirect(url_for("login_idena"))
+        abort(403)
     choice = request.form.get("vote")
     options = p.get("options") or []
     if choice not in options:
@@ -668,9 +731,8 @@ def poll_vote(poll_id):
     if request.cookies.get(cookie_key):
         return redirect(url_for("poll_results", poll_id=poll_id))
     ts = datetime.now(timezone.utc).isoformat()
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    ua = (request.headers.get("User-Agent","") or "")[:400]
-    vote_data = f"{choice}|{ts}|{ip}|{ua}|{identity}"
+    # Privacy: do not collect IP or User-Agent; only store minimal data
+    vote_data = f"{choice}|{ts}|{identity}"
     file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
     vote_dir = _paths_for_poll(poll_id)["VOTE_DIR"]
     os.makedirs(vote_dir, exist_ok=True)
@@ -684,7 +746,7 @@ def poll_vote(poll_id):
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "ip":ip, "ua":ua, "identity":identity}
+    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity":identity}
     db["counts"].setdefault(choice, 0)
     db["counts"][choice] += 1
     try:
@@ -793,6 +855,24 @@ def poll_download_chain_head(poll_id):
         abort(404)
     return send_file(hf, as_attachment=True, download_name=os.path.basename(hf))
 
+@app.route("/poll/<poll_id>/chain-head")
+def poll_chain_head_txt(poll_id):
+    hf = _paths_for_poll(poll_id)["CHAIN_HEAD_FILE"]
+    if not os.path.exists(hf):
+        abort(404)
+    with open(hf, "r") as f:
+        data = f.read()
+    return Response(data, mimetype="text/plain")
+
+@app.route("/poll/<poll_id>/log")
+def poll_log_jsonl(poll_id):
+    lf = _paths_for_poll(poll_id)["LOG_FILE"]
+    if not os.path.exists(lf):
+        abort(404)
+    with open(lf, "r") as f:
+        data = f.read()
+    return Response(data, mimetype="application/x-ndjson")
+
 @app.route("/")
 def index():
     user = session.get("user")
@@ -821,9 +901,8 @@ def vote():
     if request.cookies.get(cookie_key):
         return redirect(url_for("results"))
     ts = datetime.now(timezone.utc).isoformat()
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    ua = (request.headers.get("User-Agent","") or "")[:400]
-    vote_data = f"{choice}|{ts}|{ip}|{ua}|{identity}"
+    # Privacy: do not collect IP or User-Agent; only store minimal data
+    vote_data = f"{choice}|{ts}|{identity}"
     file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
     os.makedirs(VOTE_DIR, exist_ok=True)
     fn = os.path.join(VOTE_DIR, f"{file_hash}.txt")
@@ -836,7 +915,7 @@ def vote():
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "ip":ip, "ua":ua, "identity":identity}
+    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity":identity}
     votes_db["counts"].setdefault(choice, 0)
     votes_db["counts"][choice] += 1
     try:
@@ -932,6 +1011,24 @@ def download_chain_head():
     if not os.path.exists(CHAIN_HEAD_FILE):
         abort(404)
     return send_file(CHAIN_HEAD_FILE, as_attachment=True, download_name=os.path.basename(CHAIN_HEAD_FILE))
+
+# --- Receipter support endpoints (global) ---
+@app.route("/chain-head")
+def chain_head_txt():
+    if not os.path.exists(CHAIN_HEAD_FILE):
+        abort(404)
+    with open(CHAIN_HEAD_FILE, "r") as f:
+        data = f.read()
+    return Response(data, mimetype="text/plain")
+
+@app.route("/log")
+def log_jsonl():
+    if not os.path.exists(LOG_FILE):
+        abort(404)
+    with open(LOG_FILE, "r") as f:
+        data = f.read()
+    # Newline-delimited JSON
+    return Response(data, mimetype="application/x-ndjson")
 
 def _recompute_chain_head_until(target_index: int):
     state_head = b""

@@ -38,5 +38,36 @@
     "file_id": "b8da34c604075d9862543265a5b6f7da0b6e33424e6c8c0ff1b25504672cf7ad",
     "received_at": "2025-08-28T22:27:38.711180+00:00",
     "verified": true
+  },
+  {
+    "poll_id": "poll_4c9458d5",
+    "entry_hash": "d11f9d07d20ec8b82e9c0b6e545e73905d45dab3019fa050460b14090e841d39",
+    "index": 0,
+    "chain_head": "e999925e241b0bde89f0c3db14d2f53e70e4e5229f9b5bb5edf933ccccd8643b",
+    "timestamp": "2025-09-18T23:34:00.540247+00:00",
+    "file_id": "8f458557ada3c5ee37316a397db98641affc47fd21400ea1cd31614856ef7fbf",
+    "received_at": "2025-09-18T23:35:27.646384+00:00",
+    "verified": false
+  },
+  {
+    "poll_id": "poll_337fd48b",
+    "entry_hash": "4508193fdf1bab246d500cee0de6f451033ada78987b90b03b14c6470aa9f492",
+    "index": 0,
+    "chain_head": "731a7f09937482796d0454bcc6c1515aa9f9ac7be9c67cd24fa9e9108735ef99",
+    "timestamp": "2025-09-18T23:41:05.507964+00:00",
+    "file_id": "56c9a2785d1c0911001373122d538d6008fdf08bf00df5ae3337070c25468694",
+    "received_at": "2025-09-18T23:41:08.347974+00:00",
+    "verified": false
+  },
+  {
+    "poll_id": "poll_eaf9805d",
+    "entry_hash": "78c50fcd7ca43330d9893747d36aa641f2c7c2adeb9df3d210254955c526c5c0",
+    "index": 0,
+    "chain_head": "5af6bd9ad901f5580df1782a1e311b7c5b6c7c0aa771f20cb27c72ead0e0e061",
+    "timestamp": "2025-09-18T23:47:18.013899+00:00",
+    "file_id": "9a6dd97df468676eebc0dec356083d193e7d21724d91879afad50ec2dba75c5d",
+    "user_id": "caa0df611d60777c200a8b2027626721dc92553dc4f01f5eac70eda148d7a40a",
+    "received_at": "2025-09-18T23:47:20.882691+00:00",
+    "verified": false
   }
 ]
