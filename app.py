@@ -13,6 +13,7 @@ import os
 import secrets
 import subprocess
 import hashlib
+import hmac
 from datetime import datetime, timezone
 import json
 import logging
@@ -23,8 +24,8 @@ from flask import (
     Flask, render_template, request, redirect, url_for,
     make_response, session, Response, send_file, abort
 )
-from authlib.integrations.flask_client import OAuth
-from dotenv import load_dotenv
+# from authlib.integrations.flask_client import OAuth  # unused
+# from dotenv import load_dotenv  # unused
 import requests
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -37,7 +38,6 @@ import errno
 from werkzeug.routing import BuildError
 
 # --- Config & Constants ---
-import os
 VOTE_DIR = os.environ.get("VOTE_DIR", "votes")
 DB_FILE = os.environ.get("DB_FILE", "votes_db.json")
 LOG_FILE = os.environ.get("LOG_FILE", "votes_log.jsonl")
@@ -60,9 +60,33 @@ POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Mayb
 RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "http://localhost:7001/ingest")
 RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "http://localhost:7001/")
 
+# Privacy salts (set via env; fallback to Flask secret key after app init)
+EVIDENCE_SALT = os.getenv("EVIDENCE_SALT", "")
+IDENTITY_SALT = os.getenv("IDENTITY_SALT", "")
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
 app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
+
+# Resolve salts after app is available
+if not EVIDENCE_SALT:
+    EVIDENCE_SALT = app.secret_key
+if not IDENTITY_SALT:
+    IDENTITY_SALT = app.secret_key
+EVIDENCE_SALT_BYTES = EVIDENCE_SALT.encode()
+IDENTITY_SALT_BYTES = IDENTITY_SALT.encode()
+
+def _hmac_sha256_hex(key_bytes: bytes, data: str) -> str:
+    return hmac.new(key_bytes, (data or "").encode(), hashlib.sha256).hexdigest()
+
+def compute_id_tag(identity: str) -> str:
+    if not identity:
+        return ""
+    return _hmac_sha256_hex(IDENTITY_SALT_BYTES, identity)
+
+def compute_ev_tag(ip: str, ua: str) -> str:
+    combo = f"{ip or ''}|{ua or ''}"
+    return _hmac_sha256_hex(EVIDENCE_SALT_BYTES, combo)
 
 # If you actually want Flask to generate external URLs using BASE_URL host, you can optionally set:
 # - Prefer using BASE_URL inside helper _abs_url() below
@@ -164,23 +188,35 @@ if os.path.exists(DB_FILE):
 else:
     votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
 
-# On load, scrub legacy fingerprinting fields from global DB
+# Define save_db before first use
+def save_db():
+    with FileLock(DB_FILE + ".lock"):
+        atomic_write_json(DB_FILE, votes_db)
+
+# On load, scrub legacy fingerprinting fields from global DB and migrate identity->identity_tag
 try:
     changed = False
     for k, v in list(votes_db.get("votes", {}).items()):
         if isinstance(v, dict):
             if "ip" in v:
-                v.pop("ip", None); changed = True
+                v.pop("ip", None)
+                changed = True
             if "ua" in v:
-                v.pop("ua", None); changed = True
+                v.pop("ua", None)
+                changed = True
+            # Migrate legacy raw identity to salted tag
+            if "identity" in v and "identity_tag" not in v:
+                try:
+                    tag = compute_id_tag(v.get("identity") or "")
+                    v["identity_tag"] = tag
+                    v.pop("identity", None)
+                    changed = True
+                except Exception:
+                    logger.exception("Failed to migrate legacy identity to identity_tag (global)")
     if changed:
         save_db()
 except Exception:
     logger.exception("Failed to sanitize global DB")
-
-def save_db():
-    with FileLock(DB_FILE + ".lock"):
-        atomic_write_json(DB_FILE, votes_db)
 
 def _canonical_json(obj): return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 def _sha256_hex(b: bytes): return hashlib.sha256(b).hexdigest()
@@ -553,14 +589,24 @@ def _load_db_for_poll(poll_id: str, options: list[str]):
         try:
             with open(paths["DB_FILE"], "r") as f:
                 db = json.load(f)
-            # Scrub legacy fingerprinting fields from per-poll DB
+            # Scrub legacy fingerprinting fields from per-poll DB and migrate identity->identity_tag
             changed = False
             for _k, v in list((db.get("votes") or {}).items()):
                 if isinstance(v, dict):
                     if "ip" in v:
-                        v.pop("ip", None); changed = True
+                        v.pop("ip", None)
+                        changed = True
                     if "ua" in v:
-                        v.pop("ua", None); changed = True
+                        v.pop("ua", None)
+                        changed = True
+                    if "identity" in v and "identity_tag" not in v:
+                        try:
+                            tag = compute_id_tag(v.get("identity") or "")
+                            v["identity_tag"] = tag
+                            v.pop("identity", None)
+                            changed = True
+                        except Exception:
+                            logger.exception("Failed to migrate legacy identity to identity_tag for %s", poll_id)
             if changed:
                 try:
                     _save_db_for_poll(poll_id, db)
@@ -724,15 +770,16 @@ def poll_vote(poll_id):
     provider = user.get("_provider")
     identity = (f"idena:{user['address']}" if provider=="idena"
                 else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
+    id_tag = compute_id_tag(identity)
     db = _load_db_for_poll(poll_id, options)
-    if identity:
-        if any(v.get("identity")==identity for v in db["votes"].values()):
+    if id_tag:
+        if any(v.get("identity_tag")==id_tag for v in db["votes"].values()):
             return redirect(url_for("poll_results", poll_id=poll_id))
     if request.cookies.get(cookie_key):
         return redirect(url_for("poll_results", poll_id=poll_id))
     ts = datetime.now(timezone.utc).isoformat()
-    # Privacy: do not collect IP or User-Agent; only store minimal data
-    vote_data = f"{choice}|{ts}|{identity}"
+    # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
+    vote_data = f"{choice}|{ts}|{id_tag}"
     file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
     vote_dir = _paths_for_poll(poll_id)["VOTE_DIR"]
     os.makedirs(vote_dir, exist_ok=True)
@@ -746,7 +793,7 @@ def poll_vote(poll_id):
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity":identity}
+    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag}
     db["counts"].setdefault(choice, 0)
     db["counts"][choice] += 1
     try:
@@ -754,7 +801,7 @@ def poll_vote(poll_id):
     except Exception:
         logger.exception("save_db error")
     entry = {"poll":poll_id,"choice":choice,"timestamp":ts,"id":file_hash,
-             "identity":identity,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
+             "identity_tag":id_tag,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
     try:
         eh, _chain_head, idx = _append_log_for_poll(poll_id, entry)
     except Exception:
@@ -895,14 +942,15 @@ def vote():
     provider = user.get("_provider")
     identity = (f"idena:{user['address']}" if provider=="idena"
                 else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
-    if identity:
-        if any(v.get("identity")==identity for v in votes_db["votes"].values()):
+    id_tag = compute_id_tag(identity)
+    if id_tag:
+        if any(v.get("identity_tag")==id_tag for v in votes_db["votes"].values()):
             return redirect(url_for("results"))
     if request.cookies.get(cookie_key):
         return redirect(url_for("results"))
     ts = datetime.now(timezone.utc).isoformat()
-    # Privacy: do not collect IP or User-Agent; only store minimal data
-    vote_data = f"{choice}|{ts}|{identity}"
+    # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
+    vote_data = f"{choice}|{ts}|{id_tag}"
     file_hash = hashlib.sha256(vote_data.encode()).hexdigest()
     os.makedirs(VOTE_DIR, exist_ok=True)
     fn = os.path.join(VOTE_DIR, f"{file_hash}.txt")
@@ -915,7 +963,7 @@ def vote():
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity":identity}
+    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag}
     votes_db["counts"].setdefault(choice, 0)
     votes_db["counts"][choice] += 1
     try:
@@ -923,7 +971,7 @@ def vote():
     except Exception:
         logger.exception("save_db error")
     entry = {"poll":POLL_ID,"choice":choice,"timestamp":ts,"id":file_hash,
-             "identity":identity,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
+             "identity_tag":id_tag,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
     try:
         eh, _chain_head, idx = append_transparency_log(entry)
     except Exception:

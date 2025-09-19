@@ -1,1 +1,26 @@
-{"votes": {"ca483ba46701caf289075c84d1244e308822a69bbd2153caddb4dc2d434ea26c": {"choice": "Maybe", "timestamp": "2025-08-21T23:36:18.893880+00:00"}, "0ba8c31d19cbf5d7080d8f53957a3442a2b62fa1ceea1d3623d8ce15b9900420": {"choice": "Yes", "timestamp": "2025-08-21T23:42:17.871158+00:00"}, "91bf863e3550bcd92ccf3d1bdd3a1291f51c4939fa261b4f3544113e0d6a9001": {"choice": "Yes", "timestamp": "2025-08-21T23:46:28.690418+00:00"}, "b8da34c604075d9862543265a5b6f7da0b6e33424e6c8c0ff1b25504672cf7ad": {"choice": "Yes", "timestamp": "2025-08-28T22:23:44.974791+00:00", "identity": ""}}, "counts": {"Yes": 3, "No": 0, "Maybe": 1}}
+{
+  "votes": {
+    "ca483ba46701caf289075c84d1244e308822a69bbd2153caddb4dc2d434ea26c": {
+      "choice": "Maybe",
+      "timestamp": "2025-08-21T23:36:18.893880+00:00"
+    },
+    "0ba8c31d19cbf5d7080d8f53957a3442a2b62fa1ceea1d3623d8ce15b9900420": {
+      "choice": "Yes",
+      "timestamp": "2025-08-21T23:42:17.871158+00:00"
+    },
+    "91bf863e3550bcd92ccf3d1bdd3a1291f51c4939fa261b4f3544113e0d6a9001": {
+      "choice": "Yes",
+      "timestamp": "2025-08-21T23:46:28.690418+00:00"
+    },
+    "b8da34c604075d9862543265a5b6f7da0b6e33424e6c8c0ff1b25504672cf7ad": {
+      "choice": "Yes",
+      "timestamp": "2025-08-28T22:23:44.974791+00:00",
+      "identity_tag": ""
+    }
+  },
+  "counts": {
+    "Yes": 3,
+    "No": 0,
+    "Maybe": 1
+  }
+}
