@@ -3,11 +3,17 @@
     "9a6dd97df468676eebc0dec356083d193e7d21724d91879afad50ec2dba75c5d": {
       "choice": "Yes",
       "timestamp": "2025-09-18T23:47:18.013899+00:00",
-      "identity": "google:102597130011012535698"
+      "identity_tag": "df3e15abdf18ed695725b35c2bb9ffd3dc672a2b829f145ff2f9fb7363585ce0"
+    },
+    "13ee27b0812b37a10b4f0c23310d9f9854d72268d6c1bbe1c70ce7ac5e0b240b": {
+      "choice": "Yes",
+      "timestamp": "2025-09-21T00:02:02.354027+00:00",
+      "identity_tag": "",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf"
     }
   },
   "counts": {
     "Nope": 0,
-    "Yes": 1
+    "Yes": 2
   }
 }

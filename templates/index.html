@@ -133,7 +133,8 @@
                     <p class="note">Sign-in is optional — you can vote with or without an account.</p>
                 {% else %}
                     <p class="status">Sign-in is optional — you can vote without an account. If you prefer, sign in with 
-                        <a href="{{ url_for('login_google') }}">Google</a> or 
+                        <a href="{{ url_for('login_google') }}">Google</a>, 
+                        <a href="{{ url_for('login_microsoft') }}">Microsoft</a> or 
                         <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>.
                     </p>
                 {% endif %}

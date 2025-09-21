@@ -43,6 +43,7 @@ DB_FILE = os.environ.get("DB_FILE", "votes_db.json")
 LOG_FILE = os.environ.get("LOG_FILE", "votes_log.jsonl")
 LOG_STATE = os.environ.get("LOG_STATE", "log_state.json")
 CHAIN_HEAD_FILE = os.environ.get("CHAIN_HEAD_FILE", "chain_head.txt")
+PRIVATE_DIR = os.environ.get("PRIVATE_DIR", "private")
 
 IDENA_VERIFY_URL = os.environ.get("IDENA_VERIFY_URL", "")
 IDENA_VERIFY_METHOD = os.environ.get("IDENA_VERIFY_METHOD", "local").lower()
@@ -60,10 +61,16 @@ POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Mayb
 RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "http://localhost:7001/ingest")
 RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "http://localhost:7001/")
 
+# Microsoft OAuth config
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+MS_TENANT = os.getenv("MS_TENANT", "common")  # common | organizations | consumers | <tenant_id>
+MS_SCOPES = os.getenv("MS_SCOPES", "openid profile email")
+release = "debug"
 # Privacy salts (set via env; fallback to Flask secret key after app init)
 EVIDENCE_SALT = os.getenv("EVIDENCE_SALT", "")
 IDENTITY_SALT = os.getenv("IDENTITY_SALT", "")
-
+print("[DEBUG] InterPoll release", release, "started.")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
 app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
@@ -88,12 +95,22 @@ def compute_ev_tag(ip: str, ua: str) -> str:
     combo = f"{ip or ''}|{ua or ''}"
     return _hmac_sha256_hex(EVIDENCE_SALT_BYTES, combo)
 
+def _client_ip() -> str:
+    try:
+        xf = request.headers.get("X-Forwarded-For", "") or request.headers.get("x-forwarded-for", "")
+        if xf:
+            return xf.split(",")[0].strip()
+        return request.remote_addr or ""
+    except Exception:
+        return ""
+
 # If you actually want Flask to generate external URLs using BASE_URL host, you can optionally set:
 # - Prefer using BASE_URL inside helper _abs_url() below
 # app.config["SERVER_NAME"] = (BASE_URL.replace("https://", "").replace("http://", "") if BASE_URL else None)
 # app.config["PREFERRED_URL_SCHEME"] = "https"
 
 ## Google OAuth via google-auth-oauthlib will be handled in /login/google route
+## Guys this is a debug preview so please do not use it to decide where to send 2 bn dollars
 
 idena_sessions = {}
 used_nonces = set()
@@ -257,6 +274,38 @@ def append_transparency_log(entry: dict):
         logger.warning("ots error: %s", e)
     return eh, nh, idx
 
+# --- Private audit logging (no vote choice, for admin eyes only) ---
+def _append_private_audit(poll_id: str, ts: str, provider: str, identity: str, vote_hash: str, extra: dict | None = None):
+    if not provider or not identity:
+        return
+    try:
+        os.makedirs(PRIVATE_DIR, exist_ok=True)
+        try:
+            os.chmod(PRIVATE_DIR, 0o700)
+        except Exception:
+            pass
+        base_entry = {
+            "poll": poll_id,
+            "timestamp": ts,
+            "provider": provider,
+            "identity": identity,
+            "vote_id": vote_hash,
+        }
+        if extra:
+            base_entry.update(extra)
+        # Global audit file
+        glob_path = os.path.join(PRIVATE_DIR, "audit.jsonl")
+        with FileLock(glob_path + ".lock"):
+            with open(glob_path, "a") as f:
+                f.write(_canonical_json(base_entry) + "\n")
+        # Per-poll audit file
+        pp_path = os.path.join(PRIVATE_DIR, f"audit_{poll_id}.jsonl")
+        with FileLock(pp_path + ".lock"):
+            with open(pp_path, "a") as f:
+                f.write(_canonical_json(base_entry) + "\n")
+    except Exception:
+        logger.exception("Failed to append private audit entry for poll %s", poll_id)
+
 def iter_log_entries():
     if not os.path.exists(LOG_FILE):
         return
@@ -337,6 +386,108 @@ def add_cors_headers(resp: Response):
 def cors_preflight(sub):
     resp = make_response("", 204)
     return add_cors_headers(resp)
+
+# --- Microsoft Sign-in (OAuth 2.0 Authorization Code Flow) ---
+@app.route("/login/microsoft")
+def login_microsoft():
+    if not MS_CLIENT_ID or not MS_CLIENT_SECRET:
+        return "Microsoft OAuth not configured. Set MS_CLIENT_ID and MS_CLIENT_SECRET.", 500
+    # Preserve next if we were enforcing login for a poll
+    nxt = request.args.get("next")
+    if nxt:
+        session["_next"] = nxt
+    state = secrets.token_urlsafe(16)
+    session["ms_state"] = state
+    redirect_uri = _abs_url("login_microsoft_callback")
+    logger.info("Microsoft auth start tenant=%s redirect_uri=%s scopes=%s", MS_TENANT, redirect_uri, MS_SCOPES)
+    auth_url = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/authorize"
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "response_mode": "query",
+        "scope": MS_SCOPES,
+        "state": state,
+    }
+    return redirect(f"{auth_url}?{urlencode(params)}")
+
+def _b64url_decode_json(segment: str) -> dict:
+    import base64
+    import json as _json
+    s = segment + ("=" * ((4 - len(segment) % 4) % 4))
+    try:
+        data = base64.urlsafe_b64decode(s.encode("utf-8"))
+        return _json.loads(data.decode("utf-8"))
+    except Exception:
+        return {}
+
+@app.route("/login/microsoft/callback")
+def login_microsoft_callback():
+    err = request.args.get("error")
+    if err:
+        return f"Microsoft login error: {err}", 400
+    state = request.args.get("state")
+    if not state or state != session.get("ms_state"):
+        return "Invalid state.", 400
+    code = request.args.get("code")
+    if not code:
+        return "Missing code.", 400
+    redirect_uri = _abs_url("login_microsoft_callback")
+    token_url = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
+    data = {
+        "client_id": MS_CLIENT_ID,
+        "client_secret": MS_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "scope": MS_SCOPES,
+    }
+    try:
+        tr = requests.post(token_url, data=data, timeout=15)
+    except Exception:
+        logger.exception("Microsoft token request failed")
+        return "Token request failed", 500
+    if not tr.ok:
+        # Surface Azure AD error details to simplify setup debugging
+        detail = None
+        try:
+            dj = tr.json()
+            detail = dj.get("error_description") or dj.get("error")
+        except Exception:
+            detail = tr.text
+        logger.warning("Microsoft token exchange failed: %s %s", tr.status_code, detail)
+        return f"Token exchange failed: {tr.status_code} {detail}", 400
+    tok = tr.json()
+    idt = tok.get("id_token", "")
+    # Parse id_token claims without signature verification (trusted via token endpoint response)
+    claims = {}
+    try:
+        parts = idt.split(".")
+        if len(parts) >= 2:
+            claims = _b64url_decode_json(parts[1])
+    except Exception:
+        claims = {}
+    # Claims of interest: sub, name, preferred_username, email, oid
+    sub = claims.get("sub") or claims.get("oid") or ""
+    email = claims.get("email") or claims.get("preferred_username") or ""
+    name = claims.get("name") or ""
+    session['user'] = {
+        '_provider': 'microsoft',
+        'email': email,
+        'name': name,
+        'sub': sub,
+        'picture': None
+    }
+    # Clean state
+    session.pop("ms_state", None)
+    # Redirect back if we were enforcing login for a poll
+    nxt = session.pop('_next', None)
+    if nxt:
+        try:
+            return redirect(nxt)
+        except Exception:
+            pass
+    return redirect(url_for('index'))
 
 # --- Idena sign-in endpoints ---
 @app.route("/auth/v1/init", methods=["POST"])
@@ -513,7 +664,7 @@ def idena_callback():
 </script>
 </body></html>"""
     return Response(html, mimetype="text/html")
-
+## Migrate to django somedays for better liability.
 @app.route("/login/google")
 def login_google():
     # Desktop OAuth flow using google-auth-oauthlib
@@ -771,12 +922,19 @@ def poll_vote(poll_id):
     identity = (f"idena:{user['address']}" if provider=="idena"
                 else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
     id_tag = compute_id_tag(identity)
+    ip = _client_ip()
+    ua = request.headers.get("User-Agent", "")
+    ev_tag = compute_ev_tag(ip, ua)
     db = _load_db_for_poll(poll_id, options)
     if id_tag:
         if any(v.get("identity_tag")==id_tag for v in db["votes"].values()):
-            return redirect(url_for("poll_results", poll_id=poll_id))
+            return redirect(url_for("poll_results", poll_id=poll_id, error="account"))
+    else:
+        # Anonymous dedup: block if same evidence_tag has already voted this poll
+        if ev_tag and any(v.get("evidence_tag")==ev_tag for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id, error="device"))
     if request.cookies.get(cookie_key):
-        return redirect(url_for("poll_results", poll_id=poll_id))
+        return redirect(url_for("poll_results", poll_id=poll_id, error="device"))
     ts = datetime.now(timezone.utc).isoformat()
     # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
     vote_data = f"{choice}|{ts}|{id_tag}"
@@ -793,13 +951,25 @@ def poll_vote(poll_id):
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag}
+    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag}
     db["counts"].setdefault(choice, 0)
     db["counts"][choice] += 1
     try:
         _save_db_for_poll(poll_id, db)
     except Exception:
         logger.exception("save_db error")
+    # Private audit log: who (provider+identity) voted on which poll (no choice)
+    try:
+        _append_private_audit(
+            poll_id=poll_id,
+            ts=ts,
+            provider=(provider or ""),
+            identity=(identity or ""),
+            vote_hash=file_hash,
+            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag},
+        )
+    except Exception:
+        logger.exception("audit log error")
     entry = {"poll":poll_id,"choice":choice,"timestamp":ts,"id":file_hash,
              "identity_tag":id_tag,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
     try:
@@ -825,6 +995,13 @@ def poll_results(poll_id):
             c = counts.get(opt, 0)
             pct = round((c / total * 100.0), 2) if total else 0.0
             results_list.append({"option": opt, "count": c, "percent": pct})
+        # Map error code from query to friendly message
+        err_code = request.args.get("error")
+        err_msg = None
+        if err_code == "device":
+            err_msg = "This device has already voted."
+        elif err_code == "account":
+            err_msg = "This account has already voted."
         return render_template(
             "result.html",
             question=p.get("question"),
@@ -832,7 +1009,7 @@ def poll_results(poll_id):
             total_votes=total,
             anomalies=anomalies,
             head_hash=head,
-            error=None,
+            error=err_msg,
         )
     except Exception as e:
         logger.exception("poll results error")
@@ -943,11 +1120,17 @@ def vote():
     identity = (f"idena:{user['address']}" if provider=="idena"
                 else f"{provider}:{user.get('sub') or user.get('id') or ''}") if provider else ""
     id_tag = compute_id_tag(identity)
+    ip = _client_ip()
+    ua = request.headers.get("User-Agent", "")
+    ev_tag = compute_ev_tag(ip, ua)
     if id_tag:
         if any(v.get("identity_tag")==id_tag for v in votes_db["votes"].values()):
-            return redirect(url_for("results"))
+            return redirect(url_for("results", error="account"))
+    else:
+        if ev_tag and any(v.get("evidence_tag")==ev_tag for v in votes_db["votes"].values()):
+            return redirect(url_for("results", error="device"))
     if request.cookies.get(cookie_key):
-        return redirect(url_for("results"))
+        return redirect(url_for("results", error="device"))
     ts = datetime.now(timezone.utc).isoformat()
     # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
     vote_data = f"{choice}|{ts}|{id_tag}"
@@ -963,13 +1146,25 @@ def vote():
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag}
+    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag}
     votes_db["counts"].setdefault(choice, 0)
     votes_db["counts"][choice] += 1
     try:
         save_db()
     except Exception:
         logger.exception("save_db error")
+    # Private audit log: who (provider+identity) voted on which poll (no choice)
+    try:
+        _append_private_audit(
+            poll_id=POLL_ID,
+            ts=ts,
+            provider=(provider or ""),
+            identity=(identity or ""),
+            vote_hash=file_hash,
+            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag},
+        )
+    except Exception:
+        logger.exception("audit log error")
     entry = {"poll":POLL_ID,"choice":choice,"timestamp":ts,"id":file_hash,
              "identity_tag":id_tag,"file_hash":file_hash,"filename":f"{file_hash}.txt"}
     try:
@@ -993,6 +1188,13 @@ def results():
             pct = round((c / total * 100.0), 2) if total else 0.0
             results_list.append({"option": opt, "count": c, "percent": pct})
         state = _load_log_state()
+        # Map error code from query to friendly message
+        err_code = request.args.get("error")
+        err_msg = None
+        if err_code == "device":
+            err_msg = "This device has already voted."
+        elif err_code == "account":
+            err_msg = "This account has already voted."
         return render_template(
             "result.html",
             question=POLL_QUESTION,
@@ -1000,7 +1202,7 @@ def results():
             total_votes=total,
             anomalies=anomalies,
             head_hash=state.get("head", ""),
-            error=None,
+            error=err_msg,
         )
     except Exception as e:
         logger.exception("results page error")
