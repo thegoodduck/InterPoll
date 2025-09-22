@@ -139,12 +139,19 @@ def _login_ok_for_poll(poll: dict) -> bool:
     if req == "any":
         return prov in ("google", "idena")
     return True
-
+# ID For commits should be universal
 # --- Helpers for absolute URLs ---
 def _abs_url(path_endpoint_name: str, **values) -> str:
     """
-    Build an absolute URL. If BASE_URL is set, join to it.
-    Otherwise fall back to Flask's url_for(_external=True).
+    Build an absolute URL for a Flask endpoint.
+
+    Parameters:
+        path_endpoint_name (str): The name of the Flask endpoint.
+        **values: Additional keyword arguments for url_for.
+
+    Returns:
+        str: An absolute URL as a string. If BASE_URL is set, the URL is joined to BASE_URL;
+             otherwise, Flask's url_for with _external=True is used.
     """
     if BASE_URL:
         # Make a relative path via url_for without _external, then join
