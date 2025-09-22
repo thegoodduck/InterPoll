@@ -30,9 +30,13 @@
             {% elif req == 'idena' %}
               This poll requires Idena sign-in.
               <a href="{{ url_for('login_idena') }}">Sign in with Idena</a>
+            {% elif req == 'microsoft' %}
+              This poll requires Microsoft sign-in.
+              <a href="{{ url_for('login_microsoft') }}">Sign in with Microsoft</a>
             {% elif req == 'any' %}
               This poll requires sign-in.
               <a href="{{ url_for('login_google') }}">Google</a> ·
+              <a href="{{ url_for('login_microsoft') }}">Microsoft</a> ·
               <a href="{{ url_for('login_idena') }}">Idena</a>
             {% endif %}
           </div>

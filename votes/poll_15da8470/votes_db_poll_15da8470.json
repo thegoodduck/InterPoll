@@ -1,0 +1,20 @@
+{
+  "votes": {
+    "4733e74cc16a8e68085d68a3011da703116944a0d0d3dd6e1173085df3b6c8d2": {
+      "choice": "dewrerere",
+      "timestamp": "2025-09-22T23:04:09.095335+00:00",
+      "identity_tag": "",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf"
+    },
+    "93deee085685af19254278814e80c54a8639b4ea594ec3891b32d42bbe153fc2": {
+      "choice": "dewrerere",
+      "timestamp": "2025-09-22T23:04:43.126089+00:00",
+      "identity_tag": "6fbe60c22e327c4d72137b4193ed5855a8dd673201150743cc67e0fa5898001c",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf"
+    }
+  },
+  "counts": {
+    "ere": 0,
+    "dewrerere": 2
+  }
+}

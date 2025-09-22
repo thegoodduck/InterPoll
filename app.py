@@ -136,8 +136,10 @@ def _login_ok_for_poll(poll: dict) -> bool:
         return prov == "google"
     if req == "idena":
         return prov == "idena"
+    if req == "microsoft":
+        return prov == "microsoft"
     if req == "any":
-        return prov in ("google", "idena")
+        return prov in ("google", "idena", "microsoft")
     return True
 # ID For commits should be universal
 # --- Helpers for absolute URLs ---
@@ -918,6 +920,9 @@ def poll_vote(poll_id):
         if req == "idena":
             session["_next"] = url_for("poll_detail", poll_id=poll_id)
             return redirect(url_for("login_idena"))
+        if req == "microsoft":
+            session["_next"] = url_for("poll_detail", poll_id=poll_id)
+            return redirect(url_for("login_microsoft"))
         abort(403)
     choice = request.form.get("vote")
     options = p.get("options") or []
