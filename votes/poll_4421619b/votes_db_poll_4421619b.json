@@ -1,0 +1,22 @@
+{
+  "votes": {
+    "891b69fa9da06996ac5250faacba879cf16f5607cb74d822e8b7407b5139daad": {
+      "choice": "fff",
+      "timestamp": "2025-09-23T23:24:32.083017+00:00",
+      "identity_tag": "",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf",
+      "location_tag": "5d630e8dd3ec6b35b917ea83bd0734fd78fdc92a9c982b9e5ce75d234ecb468f"
+    },
+    "6628ada99e75282208e3f53d05b0372c30be99e5a2eb7fde17697fe4522c5af7": {
+      "choice": "fff",
+      "timestamp": "2025-09-23T23:32:11.044357+00:00",
+      "identity_tag": "",
+      "evidence_tag": "6fc83d4ed8816f360596d715b37951e1a613a290a01aebdddcc0821cb60baa24",
+      "location_tag": "a9dfeb86c1a6e00232d099e5065b0d3d1c79ea88110366cac0611fbcc6d24cd8"
+    }
+  },
+  "counts": {
+    "Nope": 0,
+    "fff": 2
+  }
+}

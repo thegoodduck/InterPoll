@@ -41,17 +41,49 @@
             {% endif %}
           </div>
         {% else %}
-        <form method="POST" action="{{ url_for('poll_vote', poll_id=poll.id) }}">
+        <form method="POST" action="{{ url_for('poll_vote', poll_id=poll.id) }}" id="vote-form">
           {% for opt in poll.options %}
           <label class="option">
             <input type="radio" name="vote" value="{{ opt }}" required /> {{ opt }}
           </label>
           {% endfor %}
+          {% if poll.location_required %}
+          <input type="hidden" name="lat" id="geo-lat" />
+          <input type="hidden" name="lon" id="geo-lon" />
+          <div id="geo-status" style="font-size:0.9em; color:#555; margin-top:6px;">
+            Obtaining location (for single-vote protection)...
+          </div>
+          {% endif %}
           <div class="actions">
-            <button type="submit">Vote</button>
+            <button type="submit" id="vote-btn">Vote</button>
             <a style="margin-left:10px" href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>
           </div>
         </form>
+        {% if poll.location_required %}
+        <script>
+        (function() {
+          const btn = document.getElementById('vote-btn');
+          const latEl = document.getElementById('geo-lat');
+          const lonEl = document.getElementById('geo-lon');
+          const statusEl = document.getElementById('geo-status');
+          if (!navigator.geolocation) {
+            statusEl.textContent = 'Geolocation not supported by this browser.';
+            btn.disabled = true;
+            return;
+          }
+          btn.disabled = true;
+          navigator.geolocation.getCurrentPosition(function(pos) {
+            latEl.value = pos.coords.latitude.toFixed(6);
+            lonEl.value = pos.coords.longitude.toFixed(6);
+            statusEl.textContent = 'Location locked (rounded & hashed, not stored raw publicly).';
+            btn.disabled = false;
+          }, function(err) {
+            statusEl.textContent = 'Unable to get location (' + err.message + '). Cannot vote on this location-required poll.';
+            btn.disabled = true;
+          }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+        })();
+        </script>
+        {% endif %}
         {% endif %}
       {% endif %}
       <p style="margin-top:14px"><a href="{{ url_for('index') }}">All polls</a></p>

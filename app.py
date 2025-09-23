@@ -70,6 +70,9 @@ release = "debug"
 # Privacy salts (set via env; fallback to Flask secret key after app init)
 EVIDENCE_SALT = os.getenv("EVIDENCE_SALT", "")
 IDENTITY_SALT = os.getenv("IDENTITY_SALT", "")
+LOCATION_SALT = os.getenv("LOCATION_SALT", "")
+# If set, skip IP+UA based anonymous dedup (helps Tor users where many share an exit IP / common UA).
+DISABLE_IP_UA_DEDUP = os.getenv("DISABLE_IP_UA_DEDUP", "0").lower() in ("1","true","yes","on")
 print("[DEBUG] InterPoll release", release, "started.")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
@@ -80,8 +83,11 @@ if not EVIDENCE_SALT:
     EVIDENCE_SALT = app.secret_key
 if not IDENTITY_SALT:
     IDENTITY_SALT = app.secret_key
+if not LOCATION_SALT:
+    LOCATION_SALT = app.secret_key
 EVIDENCE_SALT_BYTES = EVIDENCE_SALT.encode()
 IDENTITY_SALT_BYTES = IDENTITY_SALT.encode()
+LOCATION_SALT_BYTES = LOCATION_SALT.encode()
 
 def _hmac_sha256_hex(key_bytes: bytes, data: str) -> str:
     return hmac.new(key_bytes, (data or "").encode(), hashlib.sha256).hexdigest()
@@ -94,6 +100,23 @@ def compute_id_tag(identity: str) -> str:
 def compute_ev_tag(ip: str, ua: str) -> str:
     combo = f"{ip or ''}|{ua or ''}"
     return _hmac_sha256_hex(EVIDENCE_SALT_BYTES, combo)
+
+def compute_ip_tag(ip: str) -> str:
+    """HMAC of IP only for stricter same-network dedup (UA ignored)."""
+    return _hmac_sha256_hex(EVIDENCE_SALT_BYTES, ip or "")
+
+def compute_location_tag(lat: float, lon: float, precision: int = 4) -> str:
+    """Hash (HMAC) a rounded location so raw coordinates never stored publicly.
+
+    precision=4 gives ~11 m resolution (1e-4 deg). Adjust if needed.
+    """
+    try:
+        lat_r = round(float(lat), precision)
+        lon_r = round(float(lon), precision)
+    except Exception:
+        return ""
+    payload = f"{lat_r}|{lon_r}"
+    return _hmac_sha256_hex(LOCATION_SALT_BYTES, payload)
 
 def _client_ip() -> str:
     try:
@@ -872,6 +895,7 @@ def create_poll():
     options = [opt.strip() for opt in request.form.getlist("options") if opt.strip()]
     login_required = request.form.get("login_required", "none")
     cookie_mode = request.form.get("cookie_mode", "yes")
+    location_required = request.form.get("location_required", "no") == "yes"
     if not question or len(options) < 2:
         return "Poll must have a question and at least two non-empty options.", 400
     poll_id = f"poll_{uuid.uuid4().hex[:8]}"
@@ -881,6 +905,7 @@ def create_poll():
         "options": options,
         "login_required": login_required,
         "cookie_mode": cookie_mode,
+        "location_required": location_required,
         "created": datetime.now(timezone.utc).isoformat()
     }
     polls = load_polls()
@@ -925,6 +950,17 @@ def poll_vote(poll_id):
             return redirect(url_for("login_microsoft"))
         abort(403)
     choice = request.form.get("vote")
+    # Location fields (optional depending on poll)
+    loc_required = bool(p.get("location_required"))
+    raw_lat = request.form.get("lat")
+    raw_lon = request.form.get("lon")
+    location_tag = ""
+    if loc_required:
+        if not raw_lat or not raw_lon:
+            return redirect(url_for("poll_results", poll_id=poll_id, error="location"))
+        location_tag = compute_location_tag(raw_lat, raw_lon, precision=4)
+        if not location_tag:
+            return redirect(url_for("poll_results", poll_id=poll_id, error="location"))
     options = p.get("options") or []
     if choice not in options:
         return "Invalid vote option!", 400
@@ -936,17 +972,23 @@ def poll_vote(poll_id):
     id_tag = compute_id_tag(identity)
     ip = _client_ip()
     ua = request.headers.get("User-Agent", "")
-    ev_tag = compute_ev_tag(ip, ua)
+    ev_tag = compute_ev_tag(ip, ua)  # legacy (IP+UA)
+    ip_tag = compute_ip_tag(ip)      # new (IP only)
     db = _load_db_for_poll(poll_id, options)
-    if id_tag:
-        if any(v.get("identity_tag")==id_tag for v in db["votes"].values()):
-            return redirect(url_for("poll_results", poll_id=poll_id, error="account"))
-    else:
-        # Anonymous dedup: block if same evidence_tag has already voted this poll
-        if ev_tag and any(v.get("evidence_tag")==ev_tag for v in db["votes"].values()):
-            return redirect(url_for("poll_results", poll_id=poll_id, error="device"))
+    # Duplicate logic priority: account > device > location (location only if enabled and no identity match)
+    if id_tag and any(v.get("identity_tag") == id_tag for v in db["votes"].values()):
+        return redirect(url_for("poll_results", poll_id=poll_id, error="account"))
+    if not id_tag and not DISABLE_IP_UA_DEDUP:
+        # First try strict IP-only tag (new scheme)
+        if ip_tag and any(v.get("ip_tag") == ip_tag for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
+        # Fallback legacy evidence_tag (IP+UA) for pre-migration votes
+        if ev_tag and any(v.get("evidence_tag") == ev_tag for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
+    if loc_required and location_tag and any(v.get("location_tag") == location_tag for v in db["votes"].values()):
+        return redirect(url_for("poll_results", poll_id=poll_id, error="location"))
     if request.cookies.get(cookie_key):
-        return redirect(url_for("poll_results", poll_id=poll_id, error="device"))
+        return redirect(url_for("poll_results", poll_id=poll_id, error="device_cookie"))
     ts = datetime.now(timezone.utc).isoformat()
     # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
     vote_data = f"{choice}|{ts}|{id_tag}"
@@ -963,7 +1005,10 @@ def poll_vote(poll_id):
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag}
+    vote_record = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag, "ip_tag": ip_tag}
+    if location_tag:
+        vote_record["location_tag"] = location_tag
+    db["votes"][file_hash] = vote_record
     db["counts"].setdefault(choice, 0)
     db["counts"][choice] += 1
     try:
@@ -978,7 +1023,7 @@ def poll_vote(poll_id):
             provider=(provider or ""),
             identity=(identity or ""),
             vote_hash=file_hash,
-            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag},
+            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag, "ip_tag": ip_tag, "lat": raw_lat if location_tag else None, "lon": raw_lon if location_tag else None, "location_tag": location_tag if location_tag else None},
         )
     except Exception:
         logger.exception("audit log error")
@@ -1010,10 +1055,17 @@ def poll_results(poll_id):
         # Map error code from query to friendly message
         err_code = request.args.get("error")
         err_msg = None
-        if err_code == "device":
-            err_msg = "This device has already voted."
+        if err_code in ("device","device_fingerprint","device_cookie","device_ip"):
+            if err_code == "device_cookie":
+                err_msg = "This browser has already voted (cookie present)."
+            elif err_code in ("device_ip","device_fingerprint"):
+                err_msg = "A previous anonymous vote from this IP was already recorded."
+            else:
+                err_msg = "This device has already voted."
         elif err_code == "account":
             err_msg = "This account has already voted."
+        elif err_code == "location":
+            err_msg = "A vote from this location was already recorded."
         return render_template(
             "result.html",
             question=p.get("question"),
@@ -1135,14 +1187,16 @@ def vote():
     ip = _client_ip()
     ua = request.headers.get("User-Agent", "")
     ev_tag = compute_ev_tag(ip, ua)
-    if id_tag:
-        if any(v.get("identity_tag")==id_tag for v in votes_db["votes"].values()):
-            return redirect(url_for("results", error="account"))
-    else:
-        if ev_tag and any(v.get("evidence_tag")==ev_tag for v in votes_db["votes"].values()):
-            return redirect(url_for("results", error="device"))
+    ip_tag = compute_ip_tag(ip)
+    if id_tag and any(v.get("identity_tag")==id_tag for v in votes_db["votes"].values()):
+        return redirect(url_for("results", error="account"))
+    if not id_tag and not DISABLE_IP_UA_DEDUP:
+        if ip_tag and any(v.get("ip_tag") == ip_tag for v in votes_db["votes"].values()):
+            return redirect(url_for("results", error="device_ip"))
+        if ev_tag and any(v.get("evidence_tag") == ev_tag for v in votes_db["votes"].values()):
+            return redirect(url_for("results", error="device_ip"))
     if request.cookies.get(cookie_key):
-        return redirect(url_for("results", error="device"))
+        return redirect(url_for("results", error="device_cookie"))
     ts = datetime.now(timezone.utc).isoformat()
     # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
     vote_data = f"{choice}|{ts}|{id_tag}"
@@ -1158,7 +1212,7 @@ def vote():
         subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag}
+    votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag, "ip_tag": ip_tag}
     votes_db["counts"].setdefault(choice, 0)
     votes_db["counts"][choice] += 1
     try:
@@ -1173,7 +1227,7 @@ def vote():
             provider=(provider or ""),
             identity=(identity or ""),
             vote_hash=file_hash,
-            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag},
+            extra={"ip": ip, "ua": ua, "evidence_tag": ev_tag, "ip_tag": ip_tag},
         )
     except Exception:
         logger.exception("audit log error")
@@ -1203,10 +1257,17 @@ def results():
         # Map error code from query to friendly message
         err_code = request.args.get("error")
         err_msg = None
-        if err_code == "device":
-            err_msg = "This device has already voted."
+        if err_code in ("device","device_fingerprint","device_cookie","device_ip"):
+            if err_code == "device_cookie":
+                err_msg = "This browser has already voted (cookie present)."
+            elif err_code in ("device_ip","device_fingerprint"):
+                err_msg = "A previous anonymous vote from this IP was already recorded."
+            else:
+                err_msg = "This device has already voted."
         elif err_code == "account":
             err_msg = "This account has already voted."
+        elif err_code == "location":
+            err_msg = "A vote from this location was already recorded."
         return render_template(
             "result.html",
             question=POLL_QUESTION,

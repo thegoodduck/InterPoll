@@ -1,0 +1,3 @@
+poll=poll_4421619b
+index=1
+head=a5cab3184e49e47eecf39026db9be39f821d4a3e146b460b825f70fcf0991a0e

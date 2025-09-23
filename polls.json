@@ -75,5 +75,17 @@
     "login_required": "microsoft",
     "cookie_mode": "yes",
     "created": "2025-09-22T23:04:03.719302+00:00"
+  },
+  {
+    "id": "poll_4421619b",
+    "question": "doube",
+    "options": [
+      "Nope",
+      "fff"
+    ],
+    "login_required": "none",
+    "cookie_mode": "yes",
+    "location_required": true,
+    "created": "2025-09-23T23:24:21.235099+00:00"
   }
 ]
