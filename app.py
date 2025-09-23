@@ -14,6 +14,7 @@ import secrets
 import subprocess
 import hashlib
 import hmac
+import shutil
 from datetime import datetime, timezone
 import json
 import logging
@@ -298,12 +299,7 @@ def append_transparency_log(entry: dict):
         state["head"] = nh
         _save_log_state(state)
         atomic_write_text(CHAIN_HEAD_FILE, f"poll={POLL_ID}\nindex={idx}\nhead={nh}\n")
-    try:
-        subprocess.run(["ots", "stamp", CHAIN_HEAD_FILE], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        logger.debug("ots not installed")
-    except Exception as e:
-        logger.warning("ots error: %s", e)
+    safe_ots_stamp(CHAIN_HEAD_FILE)
     return eh, nh, idx
 
 # --- Private audit logging (no vote choice, for admin eyes only) ---
@@ -830,12 +826,7 @@ def _append_log_for_poll(poll_id: str, entry: dict):
         with FileLock(paths["LOG_STATE"] + ".lock"):
             atomic_write_json(paths["LOG_STATE"], state)
         atomic_write_text(paths["CHAIN_HEAD_FILE"], f"poll={poll_id}\nindex={idx}\nhead={nh}\n")
-    try:
-        subprocess.run(["ots", "stamp", paths["CHAIN_HEAD_FILE"]], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        logger.debug("ots not installed")
-    except Exception as e:
-        logger.warning("ots error: %s", e)
+    safe_ots_stamp(paths["CHAIN_HEAD_FILE"])
     return eh, nh, idx
 
 def _iter_log_entries_for_poll(poll_id: str):
@@ -1001,10 +992,7 @@ def poll_vote(poll_id):
     except Exception:
         logger.exception("Vote file error")
         return "Error saving vote", 500
-    try:
-        subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    safe_ots_stamp(fn)
     vote_record = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag, "ip_tag": ip_tag}
     if location_tag:
         vote_record["location_tag"] = location_tag
@@ -1208,10 +1196,7 @@ def vote():
     except Exception:
         logger.exception("Vote file error")
         return "Error saving vote", 500
-    try:
-        subprocess.run(["ots", "stamp", fn], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    safe_ots_stamp(fn)
     votes_db["votes"][file_hash] = {"choice":choice, "timestamp":ts, "identity_tag":id_tag, "evidence_tag": ev_tag, "ip_tag": ip_tag}
     votes_db["counts"].setdefault(choice, 0)
     votes_db["counts"][choice] += 1
@@ -1378,6 +1363,32 @@ def _recompute_chain_head_until(target_index: int):
                 found = eh
                 break
     return (state_head.hex() if state_head else None), found
+
+# --- OpenTimestamps helper ---
+def safe_ots_stamp(path: str):
+    """Safely stamp or upgrade an OpenTimestamps proof without noisy warnings.
+
+    Behavior:
+      - If ots binary missing: silent debug log only.
+      - If sidecar (path.ots) exists: attempt 'ots upgrade path.ots'.
+      - Else: run 'ots stamp path'.
+      - All failures are non-fatal; warnings downgraded to debug unless unexpected.
+    """
+    try:
+        if not shutil.which("ots"):
+            logger.debug("ots not installed; skipping stamp for %s", path)
+            return
+        sidecar = path + ".ots"
+        if os.path.exists(sidecar):
+            # Non-fatal upgrade; don't use check=True so failures don't raise.
+            subprocess.run(["ots", "upgrade", sidecar], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["ots", "stamp", path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        # If file exists race or similar, just log at debug.
+        logger.debug("ots command non-zero for %s: %s", path, e)
+    except Exception as e:
+        logger.debug("ots unexpected error for %s: %s", path, e)
 
 @app.route("/verify", methods=["POST"])
 def verify_receipt():
