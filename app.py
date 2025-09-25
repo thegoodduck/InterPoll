@@ -61,6 +61,8 @@ POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Mayb
 # Optional Receipter integration (defaults to local receipter)
 RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "http://localhost:7001/ingest")
 RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "http://localhost:7001/")
+# Optionally send receipts server-side as well (in addition to client auto-send)
+RECEIPTER_SERVER_POST = os.getenv("RECEIPTER_SERVER_POST", "0").lower() in ("1","true","yes","on")
 
 # Microsoft OAuth config
 MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
@@ -208,7 +210,7 @@ class FileLock:
             fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
         finally:
             self.f.close()
-
+# Writes JSON using an atomic independently written file name
 def atomic_write_json(path, obj):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path) or ".") as tf:
@@ -1022,6 +1024,21 @@ def poll_vote(poll_id):
     except Exception:
         logger.exception("log append error")
         eh, idx = None, 0
+    # Optional server-side push to Receipter
+    try:
+        if eh is not None:
+            # read current chain head for this poll
+            head = ""
+            st_path = _paths_for_poll(poll_id)["LOG_STATE"]
+            if os.path.exists(st_path):
+                try:
+                    with open(st_path, "r") as f:
+                        head = (json.load(f) or {}).get("head", "")
+                except Exception:
+                    head = ""
+            _post_receipt_to_receipter(poll_id, eh, idx, head, ts, file_hash)
+    except Exception:
+        logger.debug("Receipter server POST (per-poll) failed", exc_info=True)
     resp = make_response(redirect(url_for("poll_receipt", poll_id=poll_id, h=(eh or ""), i=idx)))
     secure = os.getenv("PRODUCTION","").lower() in ("1","true")
     resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
@@ -1223,6 +1240,12 @@ def vote():
     except Exception:
         logger.exception("log append error")
         eh, idx = None, 0
+    # Optional server-side push to Receipter (global poll)
+    try:
+        if eh is not None:
+            _post_receipt_to_receipter(POLL_ID, eh, idx, _load_log_state().get("head", ""), ts, file_hash)
+    except Exception:
+        logger.debug("Receipter server POST (global) failed", exc_info=True)
     resp = make_response(redirect(url_for("receipt", h=eh or "", i=idx)))
     secure = os.getenv("PRODUCTION","").lower() in ("1","true")
     resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
@@ -1389,6 +1412,29 @@ def safe_ots_stamp(path: str):
         logger.debug("ots command non-zero for %s: %s", path, e)
     except Exception as e:
         logger.debug("ots unexpected error for %s: %s", path, e)
+
+# --- Receipter server-side posting (optional) ---
+def _post_receipt_to_receipter(poll_id: str, entry_hash: str, index: int, chain_head: str, ts: str, file_id: str):
+    if not RECEIPTER_SERVER_POST:
+        return
+    url = RECEIPTER_POST_URL or ""
+    if not url:
+        return
+    payload = {
+        "poll_id": poll_id,
+        "entry_hash": entry_hash,
+        "index": index,
+        "chain_head": chain_head,
+        "timestamp": ts,
+        "file_id": file_id,
+    }
+    try:
+        # Best-effort, short timeout, ignore response body
+        r = requests.post(url, json=payload, timeout=3)
+        if not r.ok:
+            logger.debug("Receipter POST non-OK %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logger.debug("Receipter POST failed: %s", e)
 
 @app.route("/verify", methods=["POST"])
 def verify_receipt():

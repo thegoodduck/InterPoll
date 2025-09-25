@@ -1,0 +1,29 @@
+{
+  "votes": {
+    "630be9041170a604e971eadc3c29ad95d5d2add3b855e3f1ff79f1f27f39a33f": {
+      "choice": "Yes",
+      "timestamp": "2025-09-24T23:45:45.378169+00:00",
+      "identity_tag": "",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf",
+      "ip_tag": "9cf662e0509f5422f5e77835d726afa23dd7907b2eaec85666e1ff581ae04cf4"
+    },
+    "74f3c085487c5390bef8eea6f8b80730b31fb0a465dbfc46c6476a783fd0101d": {
+      "choice": "Yes",
+      "timestamp": "2025-09-24T23:50:57.791995+00:00",
+      "identity_tag": "6fbe60c22e327c4d72137b4193ed5855a8dd673201150743cc67e0fa5898001c",
+      "evidence_tag": "3a6545c1aba002794465e35806ce8fc3529bb41071e139f3640207694bbe69bf",
+      "ip_tag": "9cf662e0509f5422f5e77835d726afa23dd7907b2eaec85666e1ff581ae04cf4"
+    },
+    "24af45a571e13f7d9d36b46a12ad6b47484b5d8a75c2780ef6b9a0550a0a9036": {
+      "choice": "Yes",
+      "timestamp": "2025-09-25T00:10:23.556845+00:00",
+      "identity_tag": "df3e15abdf18ed695725b35c2bb9ffd3dc672a2b829f145ff2f9fb7363585ce0",
+      "evidence_tag": "de8906ca6bbfd6111bc0dd032685e866ead17ac0902d6dea0ee18860f1d2b367",
+      "ip_tag": "f2f4fb7b450015635295456ca5e1773b11d77d4b67fdc21d8ef55a8486fcf2fe"
+    }
+  },
+  "counts": {
+    "Nope": 0,
+    "Yes": 3
+  }
+}
