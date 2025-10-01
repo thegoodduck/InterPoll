@@ -137,6 +137,7 @@ def _client_ip() -> str:
 
 ## Google OAuth via google-auth-oauthlib will be handled in /login/google route
 ## Guys this is a debug preview so please do not use it to decide where to send 2 bn dollars
+## Will hash gvt ID using argon2
 
 idena_sessions = {}
 used_nonces = set()
@@ -146,7 +147,7 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
-
+# Sep 30 19:35
 # --- Auth helpers for per-poll login requirements ---
 def _current_provider() -> str:
     u = session.get("user") or {}
