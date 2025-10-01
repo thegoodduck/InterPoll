@@ -29,6 +29,18 @@ from flask import (
 # from dotenv import load_dotenv  # unused
 import requests
 from google_auth_oauthlib.flow import InstalledAppFlow
+import sqlite3
+try:
+    from argon2 import PasswordHasher
+    _argon2_available = True
+except Exception:
+    _argon2_available = False
+try:
+    import face_recognition  # heavy dep; optional
+    _face_rec_available = True
+except Exception:
+    _face_rec_available = False
+import io
 from googleapiclient.discovery import build
 import uuid
 from eth_account.messages import encode_defunct
@@ -70,16 +82,29 @@ MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
 MS_TENANT = os.getenv("MS_TENANT", "common")  # common | organizations | consumers | <tenant_id>
 MS_SCOPES = os.getenv("MS_SCOPES", "openid profile email")
 release = "debug"
+# --- Government ID verification (pre-app creation placeholders) ---
+GOV_ID_ENABLED = os.getenv("GOV_ID_ENABLED", "0").lower() in ("1","true","yes","on")
+GOV_ID_DB = os.getenv("GOV_ID_DB", "voters.db")
+_GOV_ID_SALT_ENV = os.getenv("GOV_ID_SALT")
+GOV_ID_REQUIRE_FACE = os.getenv("GOV_ID_REQUIRE_FACE", "1").lower() in ("1","true","yes","on")
+GOV_ID_FACE_THRESHOLD = float(os.getenv("GOV_ID_FACE_THRESHOLD", "0.55"))  # cosine similarity threshold
+if GOV_ID_ENABLED and not _argon2_available:
+    print("[WARN] GOV_ID_ENABLED but argon2 not installed; falling back to sha256.")
 # Privacy salts (set via env; fallback to Flask secret key after app init)
 EVIDENCE_SALT = os.getenv("EVIDENCE_SALT", "")
 IDENTITY_SALT = os.getenv("IDENTITY_SALT", "")
 LOCATION_SALT = os.getenv("LOCATION_SALT", "")
+# Global override: disable all location-required polls if set (default off)
+LOCATION_FEATURE_ENABLED = os.getenv("LOCATION_FEATURE_ENABLED", "0").lower() in ("1","true","yes","on")
 # If set, skip IP+UA based anonymous dedup (helps Tor users where many share an exit IP / common UA).
 DISABLE_IP_UA_DEDUP = os.getenv("DISABLE_IP_UA_DEDUP", "0").lower() in ("1","true","yes","on")
 print("[DEBUG] InterPoll release", release, "started.")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
 app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
+
+# Finalize GOV_ID_SALT now that app.secret_key is known
+GOV_ID_SALT = _GOV_ID_SALT_ENV or app.secret_key
 
 # Resolve salts after app is available
 if not EVIDENCE_SALT:
@@ -147,6 +172,83 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# --- Government ID: DB init ---
+def _voters_conn():
+    return sqlite3.connect(GOV_ID_DB)
+
+def _init_voters_table():
+    if not GOV_ID_ENABLED:
+        return
+    with _voters_conn() as c:
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS voters (
+                voter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_number_hash TEXT NOT NULL,
+                name_hash TEXT NOT NULL,
+                dob_hash TEXT NOT NULL,
+                expiry_hash TEXT,
+                face_embedding BLOB,
+                has_voted INTEGER DEFAULT 0,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(id_number_hash, name_hash, dob_hash)
+            )"""
+        )
+        c.commit()
+
+_init_voters_table()
+
+# --- Government ID helpers ---
+if _argon2_available:
+    _ph = PasswordHasher()
+    def _hash_field(val: str) -> str:
+        # Argon2 hashes include salt internally; prefix deterministic salt to input to reduce raw-identical leakage.
+        return _ph.hash((GOV_ID_SALT or "") + (val or ""))
+else:
+    def _hash_field(val: str) -> str:
+        return hashlib.sha256(((GOV_ID_SALT or "") + (val or "")).encode()).hexdigest()
+
+def _normalize_space(s: str) -> str:
+    return " ".join((s or "").strip().split())
+
+def _face_embed(image_bytes: bytes):
+    if not (_face_rec_available and image_bytes):
+        return None
+    try:
+        arr = face_recognition.load_image_file(io.BytesIO(image_bytes))
+        enc = face_recognition.face_encodings(arr)
+        if not enc:
+            return None
+        # store as raw bytes of float32 list for compactness
+        import numpy as np
+        vec = np.array(enc[0], dtype='float32')
+        return vec.tobytes()
+    except Exception:
+        logger.debug("face embed failed", exc_info=True)
+        return None
+
+def _cosine_sim_bytes(a_bytes: bytes, b_bytes: bytes) -> float:
+    import numpy as np
+    if not (a_bytes and b_bytes):
+        return 0.0
+    a = np.frombuffer(a_bytes, dtype='float32')
+    b = np.frombuffer(b_bytes, dtype='float32')
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    return float(a.dot(b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+def _find_voter(id_number_hash: str, name_hash: str, dob_hash: str):
+    with _voters_conn() as c:
+        cur = c.execute("SELECT voter_id, expiry_hash, face_embedding, has_voted FROM voters WHERE id_number_hash=? AND name_hash=? AND dob_hash=?", (id_number_hash, name_hash, dob_hash))
+        return cur.fetchone()
+
+def _mark_voted(voter_id: int):
+    try:
+        with _voters_conn() as c:
+            c.execute("UPDATE voters SET has_voted=1 WHERE voter_id=?", (voter_id,))
+            c.commit()
+    except Exception:
+        logger.debug("mark voted failed", exc_info=True)
 # Sep 30 19:35
 # --- Auth helpers for per-poll login requirements ---
 def _current_provider() -> str:
@@ -695,6 +797,89 @@ def idena_callback():
 </script>
 </body></html>"""
     return Response(html, mimetype="text/html")
+## Government ID Registration & Login
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    if not GOV_ID_ENABLED:
+        return {"error": "gov_id_disabled"}, 404
+    # Expect multipart form: id_image, selfie (optional if face not required), plus optional manual fields to bypass OCR for MVP.
+    id_img_file = request.files.get("id_image")
+    selfie_file = request.files.get("selfie")
+    full_name = _normalize_space(request.form.get("full_name", ""))
+    dob = _normalize_space(request.form.get("dob", ""))  # YYYY-MM-DD
+    id_number = _normalize_space(request.form.get("id_number", ""))
+    expiry = _normalize_space(request.form.get("expiry", ""))
+    if not (id_img_file and full_name and dob and id_number):
+        return {"error": "missing_fields"}, 400
+    id_img_bytes = id_img_file.read()
+    selfie_bytes = selfie_file.read() if selfie_file else None
+    # Face embeddings
+    face_embed_id = _face_embed(id_img_bytes) if GOV_ID_REQUIRE_FACE else None
+    face_embed_selfie = _face_embed(selfie_bytes) if (GOV_ID_REQUIRE_FACE and selfie_bytes) else None
+    if GOV_ID_REQUIRE_FACE:
+        if not (face_embed_id and face_embed_selfie):
+            return {"error": "face_missing"}, 400
+        sim = _cosine_sim_bytes(face_embed_id, face_embed_selfie)
+        if sim < GOV_ID_FACE_THRESHOLD:
+            return {"error": "face_mismatch", "similarity": sim}, 400
+        # use selfie embedding as canonical (better quality) if available
+        store_embed = face_embed_selfie
+    else:
+        store_embed = None
+    # Hash fields
+    try:
+        name_hash = _hash_field(full_name.lower())
+        dob_hash = _hash_field(dob)
+        id_number_hash = _hash_field(id_number.upper())
+        expiry_hash = _hash_field(expiry) if expiry else None
+    except Exception:
+        logger.exception("hash failure")
+        return {"error": "hash_failed"}, 500
+    # Insert if not exists
+    with _voters_conn() as c:
+        # uniqueness enforced by unique constraint; detect duplicate
+        try:
+            c.execute(
+                "INSERT INTO voters (id_number_hash, name_hash, dob_hash, expiry_hash, face_embedding) VALUES (?,?,?,?,?)",
+                (id_number_hash, name_hash, dob_hash, expiry_hash, store_embed)
+            )
+            c.commit()
+        except sqlite3.IntegrityError:
+            return {"error": "already_registered"}, 409
+        voter_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    session['voter'] = {"voter_id": voter_id, "id_number_hash": id_number_hash}
+    return {"success": True, "voter_id": voter_id}
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    if not GOV_ID_ENABLED:
+        return {"error": "gov_id_disabled"}, 404
+    full_name = _normalize_space(request.form.get("full_name", ""))
+    dob = _normalize_space(request.form.get("dob", ""))
+    id_number = _normalize_space(request.form.get("id_number", ""))
+    selfie_file = request.files.get("selfie")
+    if not (full_name and dob and id_number):
+        return {"error": "missing_fields"}, 400
+    name_hash = _hash_field(full_name.lower())
+    dob_hash = _hash_field(dob)
+    id_number_hash = _hash_field(id_number.upper())
+    rec = _find_voter(id_number_hash, name_hash, dob_hash)
+    if not rec:
+        return {"error": "not_found"}, 404
+    voter_id, expiry_hash, face_embedding, has_voted = rec
+    # Optional selfie check
+    if GOV_ID_REQUIRE_FACE and face_embedding is not None:
+        if not selfie_file:
+            return {"error": "selfie_required"}, 400
+        selfie_bytes = selfie_file.read()
+        self_embed = _face_embed(selfie_bytes)
+        if not self_embed:
+            return {"error": "face_missing"}, 400
+        sim = _cosine_sim_bytes(face_embedding, self_embed)
+        if sim < GOV_ID_FACE_THRESHOLD:
+            return {"error": "face_mismatch", "similarity": sim}, 400
+    session['voter'] = {"voter_id": voter_id, "id_number_hash": id_number_hash, "has_voted": bool(has_voted)}
+    return {"success": True, "voter_id": voter_id, "has_voted": bool(has_voted)}
 ## Migrate to django somedays for better liability.
 @app.route("/login/google")
 def login_google():
@@ -889,7 +1074,8 @@ def create_poll():
     options = [opt.strip() for opt in request.form.getlist("options") if opt.strip()]
     login_required = request.form.get("login_required", "none")
     cookie_mode = request.form.get("cookie_mode", "yes")
-    location_required = request.form.get("location_required", "no") == "yes"
+    loc_req_raw = request.form.get("location_required", "no")
+    location_required = (loc_req_raw == "yes") and LOCATION_FEATURE_ENABLED
     if not question or len(options) < 2:
         return "Poll must have a question and at least two non-empty options.", 400
     poll_id = f"poll_{uuid.uuid4().hex[:8]}"
@@ -944,8 +1130,12 @@ def poll_vote(poll_id):
             return redirect(url_for("login_microsoft"))
         abort(403)
     choice = request.form.get("vote")
+    # Gov ID: enforce single vote per verified ID if present
+    voter_session = session.get('voter') if GOV_ID_ENABLED else None
+    if voter_session and voter_session.get('has_voted'):
+        return redirect(url_for('poll_results', poll_id=poll_id, error='account'))
     # Location fields (optional depending on poll)
-    loc_required = bool(p.get("location_required"))
+    loc_required = LOCATION_FEATURE_ENABLED and bool(p.get("location_required"))
     raw_lat = request.form.get("lat")
     raw_lon = request.form.get("lon")
     location_tag = ""
@@ -1040,6 +1230,11 @@ def poll_vote(poll_id):
             _post_receipt_to_receipter(poll_id, eh, idx, head, ts, file_hash)
     except Exception:
         logger.debug("Receipter server POST (per-poll) failed", exc_info=True)
+    # Mark gov ID as voted
+    if voter_session and voter_session.get('voter_id'):
+        _mark_voted(voter_session['voter_id'])
+        voter_session['has_voted'] = True
+        session['voter'] = voter_session
     resp = make_response(redirect(url_for("poll_receipt", poll_id=poll_id, h=(eh or ""), i=idx)))
     secure = os.getenv("PRODUCTION","").lower() in ("1","true")
     resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
@@ -1182,6 +1377,9 @@ def index():
 @app.route("/vote", methods=["POST"])
 def vote():
     choice = request.form.get("vote")
+    voter_session = session.get('voter') if GOV_ID_ENABLED else None
+    if voter_session and voter_session.get('has_voted'):
+        return redirect(url_for('results', error='account'))
     if choice not in POLL_OPTIONS:
         return "Invalid vote option!", 400
     cookie_key = f"voted_{POLL_ID}"
@@ -1247,6 +1445,10 @@ def vote():
             _post_receipt_to_receipter(POLL_ID, eh, idx, _load_log_state().get("head", ""), ts, file_hash)
     except Exception:
         logger.debug("Receipter server POST (global) failed", exc_info=True)
+    if voter_session and voter_session.get('voter_id'):
+        _mark_voted(voter_session['voter_id'])
+        voter_session['has_voted'] = True
+        session['voter'] = voter_session
     resp = make_response(redirect(url_for("receipt", h=eh or "", i=idx)))
     secure = os.getenv("PRODUCTION","").lower() in ("1","true")
     resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)

@@ -138,6 +138,35 @@
                         <a href="javascript:void(0)" onclick="loginWithIdena()">Idena</a>.
                     </p>
                 {% endif %}
+                                {% if GOV_ID_ENABLED %}
+                                <div style="margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:10px; background:#f1f5f9;">
+                                    <strong>Government ID (one-person verification)</strong>
+                                    <p class="note" style="margin:6px 0 8px 0;">Optional extra assurance: register once to guarantee one human = one vote. We never store raw ID images – only salted hashes and a face embedding vector.</p>
+                                    {% if session.voter %}
+                                        <p class="status success">Verified voter ID #{{ session.voter.voter_id }} · one vote limit enforced.</p>
+                                    {% else %}
+                                    <form method="post" action="/auth/login" enctype="multipart/form-data" style="margin-bottom:6px; display:flex; flex-direction:column; gap:6px;">
+                                        <input name="full_name" placeholder="Full name on ID" required />
+                                        <input name="dob" placeholder="Date of birth (YYYY-MM-DD)" required />
+                                        <input name="id_number" placeholder="ID Number" required />
+                                        <input type="file" name="selfie" accept="image/*" {% if GOV_ID_REQUIRE_FACE %}required{% endif %} />
+                                        <button style="align-self:flex-start;">Gov ID Login</button>
+                                    </form>
+                                    <details style="font-size:0.75rem; line-height:1.1;">
+                                        <summary style="cursor:pointer;">Need to register first?</summary>
+                                        <form method="post" action="/auth/register" enctype="multipart/form-data" style="margin-top:6px; display:flex; flex-direction:column; gap:6px;">
+                                            <input name="full_name" placeholder="Full name on ID" required />
+                                            <input name="dob" placeholder="Date of birth (YYYY-MM-DD)" required />
+                                            <input name="id_number" placeholder="ID Number" required />
+                                            <input name="expiry" placeholder="Expiry (optional)" />
+                                            <label style="font-size:0.7rem;">ID Image <input type="file" name="id_image" accept="image/*" required /></label>
+                                            <label style="font-size:0.7rem;">Selfie <input type="file" name="selfie" accept="image/*" {% if GOV_ID_REQUIRE_FACE %}required{% endif %} /></label>
+                                            <button style="align-self:flex-start;">Register Gov ID</button>
+                                        </form>
+                                    </details>
+                                    {% endif %}
+                                </div>
+                                {% endif %}
             </div>
 
             <!-- Poll directory only, with search -->

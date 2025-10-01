@@ -3,3 +3,7 @@ opentimestamps-client
 authlib
 python-dotenv
 eth-account
+argon2-cffi
+face-recognition
+Pillow
+numpy
