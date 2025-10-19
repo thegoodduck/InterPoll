@@ -4,25 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>InterPoll</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
     <style>
-        :root { --brand:#2563eb; --fg:#0f172a; --muted:#6b7280; --card:#ffffff; --line:#e5e7eb; --bg:#f8fafc; }
-        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 0; background: var(--bg); color: var(--fg); }
-        .shell { max-width: 880px; margin: 32px auto; padding: 0 16px; }
-        .header { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; }
-        .header h1 { margin:0; font-size: 1.5rem; letter-spacing: -0.2px; }
-        .toolbar a.btn { padding: 8px 12px; border-radius: 10px; border: 1px solid var(--brand); color:#fff; background: var(--brand); text-decoration:none; font-weight:500; }
-        .stack { display: grid; grid-template-columns: 1fr; gap: 16px; }
-        .card { background: var(--card); border:1px solid var(--line); border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 16px 18px; }
-        .section-title { margin: 0 0 8px 0; font-size: 1.1rem; }
-        .status { font-size: 0.92rem; color: var(--muted); }
-        .status .chip { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#f1f5f9; color:#334155; }
-        .option { margin: 0.5rem 0; display:block; }
-        .actions { margin-top: 1rem; }
-        button { padding: 0.6rem 1rem; border-radius: 10px; border: 1px solid var(--brand); background: var(--brand); color: white; cursor: pointer; }
-        button:disabled { background: #9ca3af; border-color: #9ca3af; cursor: not-allowed; }
-        .note { color: var(--muted); font-size: 0.9rem; }
-        .success { color: #059669; }
-        a { color: var(--brand); text-decoration: none; }
+        /* Minimal page-specific tweaks can remain inline */
         .poll-list { list-style:none; margin: 8px 0 0 0; padding:0; }
         .poll-item { padding: 12px 10px; border-top: 1px dashed var(--line); display:flex; align-items:baseline; gap:10px; }
         .poll-item:first-child { border-top: none; }
@@ -172,6 +156,7 @@
             <!-- Poll directory only, with search -->
             <div class="card">
                 <p class="section-title">Available polls</p>
+                <p class="note">Minimum session age to vote: {{ DEFAULT_MIN_SESSION_AGE_MINUTES }} minute(s) unless the poll specifies otherwise.</p>
                 <input id="search" type="search" placeholder="Search polls…" style="width:100%;padding:10px;border-radius:10px;border:1px solid #e5e7eb" oninput="filterPolls()" />
                 {% if polls and polls|length > 0 %}
                     <ul id="pollList" class="poll-list">
@@ -182,6 +167,8 @@
                                 <div class="poll-meta">
                                     {{ p.options|length }} option{{ '' if (p.options|length)==1 else 's' }}
                                     {% if p.created %} • created {{ p.created }}{% endif %}
+                                    {% if p.allow_multiple %} • multiple votes allowed{% endif %}
+                                    {% if p.min_session_age %} • min session: {{ p.min_session_age }}m{% endif %}
                                 </div>
                                 <div class="poll-meta"><a href="{{ url_for('poll_results', poll_id=p.id) }}">Results</a> • Share: <code>{{ request.host_url.rstrip('/') }}{{ url_for('poll_detail', poll_id=p.id) }}</code></div>
                             </div>
@@ -190,6 +177,9 @@
                     </ul>
                 {% else %}
                     <p class="note">No polls yet. Create one to get started.</p>
+                {% endif %}
+                {% if COOKIE_SAMESITE.lower() == 'none' %}
+                    <p class="note">Third-party cookie mode enabled (SameSite=None, Secure). Useful when embedding in iframes across origins.</p>
                 {% endif %}
             </div>
         </div>

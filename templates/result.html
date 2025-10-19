@@ -5,9 +5,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Poll Results</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
     <style>
-        body { font-family: Arial, sans-serif; background: #f7f7fa; }
-        .container { max-width: 600px; margin: 40px auto; background: rgba(255,255,255,0.8); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); padding: 32px; }
+        body { background: var(--bg); }
+        .container { max-width: 780px; margin: 40px auto; background: var(--card); border:1px solid var(--line); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.06); padding: 32px; }
         h2 { text-align: center; }
         .results-table { width: 100%; border-collapse: collapse; margin-top: 24px; }
         .results-table th, .results-table td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
@@ -39,7 +40,7 @@
                 <td>{{ r.count }}</td>
                 <td>{{ r.percent }}%</td>
                 <td>
-                    <span class="bar" style="width: calc({{ r.percent }} * var(--bar-width-multiplier)px);"></span>
+                    <span class="bar js-bar" data-percent="{{ r.percent }}"></span>
                 </td>
             </tr>
             {% endfor %}
@@ -59,7 +60,16 @@
                 <div class="anomaly">Error: {{ error }}</div>
             {% endif %}
         </div>
-        <p style="text-align:center; margin-top:32px;"><a href="/">Back to poll</a></p>
+                <p style="text-align:center; margin-top:32px;"><a href="/">Back to poll</a></p>
     </div>
+        <script>
+            (function(){
+                const mult = 2.5; // px per percent
+                document.querySelectorAll('.js-bar').forEach(el => {
+                    const pct = parseFloat(el.getAttribute('data-percent') || '0');
+                    el.style.width = Math.max(0, pct) * mult + 'px';
+                });
+            })();
+        </script>
 </body>
 </html>

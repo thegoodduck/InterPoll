@@ -18,6 +18,16 @@
   <div class="shell">
     <div class="card">
       <h2 style="margin:0 0 10px 0;">{{ poll.question }}</h2>
+      <p class="note" style="margin:6px 0 12px 0;">
+        {% if poll.allow_multiple %}
+          This poll allows multiple votes from the same device.
+        {% else %}
+          This poll allows a single vote per device/account.
+        {% endif %}
+        {% if poll.min_session_age %}
+          • You must keep this page open for at least {{ poll.min_session_age }} minute(s) before voting.
+        {% endif %}
+      </p>
       {% if voted %}
         <p>Thanks, your vote was recorded. <a href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>.</p>
       {% else %}
@@ -59,6 +69,27 @@
             <a style="margin-left:10px" href="{{ url_for('poll_results', poll_id=poll.id) }}">See results</a>
           </div>
         </form>
+        {% if poll.min_session_age %}
+        <script>
+        (function() {
+          const btn = document.getElementById('vote-btn');
+          const started = Number('{{ session.session_started_at or 0 }}');
+          const minMins = Number('{{ poll.min_session_age or 0 }}');
+          if (!started || !minMins) return;
+          const req = started*1000 + minMins*60*1000;
+          function tick(){
+            const now = Date.now();
+            const remainMs = req - now;
+            if (remainMs <= 0) { btn.disabled = false; return; }
+            btn.disabled = true;
+            const mins = Math.ceil(remainMs/60000);
+            btn.textContent = 'Vote (available in ~' + mins + 'm)';
+            requestAnimationFrame(tick);
+          }
+          tick();
+        })();
+        </script>
+        {% endif %}
         {% if poll.location_required %}
         <script>
         (function() {

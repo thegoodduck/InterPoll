@@ -101,7 +101,20 @@ DISABLE_IP_UA_DEDUP = os.getenv("DISABLE_IP_UA_DEDUP", "0").lower() in ("1","tru
 print("[DEBUG] InterPoll release", release, "started.")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
-app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True)
+# Cookie/site settings (third-party cookie support)
+COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "Lax")  # Lax | None | Strict
+# If SameSite=None, cookies must be Secure in modern browsers
+SESSION_SECURE = os.getenv("SESSION_COOKIE_SECURE", "").lower() in ("1","true","yes","on")
+if COOKIE_SAMESITE.lower() == "none":
+    SESSION_SECURE = True
+app.config.update(
+    SESSION_COOKIE_SAMESITE=COOKIE_SAMESITE,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=SESSION_SECURE,
+)
+
+# Session gating: minimum age before voting
+DEFAULT_MIN_SESSION_AGE_MINUTES = int(os.getenv("DEFAULT_MIN_SESSION_AGE_MINUTES", "60"))
 
 # Finalize GOV_ID_SALT now that app.secret_key is known
 GOV_ID_SALT = _GOV_ID_SALT_ENV or app.secret_key
@@ -172,6 +185,16 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# --- Session tracking: record session start time ---
+@app.before_request
+def _ensure_session_started():
+    try:
+        if "session_started_at" not in session:
+            session["session_started_at"] = int(datetime.now(timezone.utc).timestamp())
+    except Exception:
+        # Don't block request if session can't be set
+        pass
 
 # --- Government ID: DB init ---
 def _voters_conn():
@@ -723,7 +746,14 @@ def idena_authenticate():
     else:
         logger.info("authenticate bad sig addr=%s token=%s", addr, token)
         return {"success": True, "authenticated": False, "error": "bad_signature"}
-
+def microsoft_mockup_user():
+    return {
+        '_provider': 'microsoft',
+        'email': '<user_email>',
+        'name': '<user_name>',
+        'sub': '<user_id>',
+        'picture': None
+    }
 # Backward compatibility for legacy templates referencing 'auth_idena'
 @app.route("/auth/idena", methods=["GET", "POST"])
 def auth_idena_compat():
@@ -849,7 +879,7 @@ def auth_register():
         voter_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     session['voter'] = {"voter_id": voter_id, "id_number_hash": id_number_hash}
     return {"success": True, "voter_id": voter_id}
-
+# Will implement different local OCR routes.
 @app.route("/auth/login", methods=["POST"])
 def auth_login():
     if not GOV_ID_ENABLED:
@@ -1068,12 +1098,20 @@ def _rebuild_counts_for_poll(poll_id: str, options: list[str]):
 @app.route("/create_poll", methods=["GET", "POST"])
 def create_poll():
     if request.method == "GET":
-        return render_template("create_poll.html")
+        return render_template("create_poll.html", DEFAULT_MIN_SESSION_AGE_MINUTES=DEFAULT_MIN_SESSION_AGE_MINUTES)
     # POST: handle form
     question = request.form.get("question", "").strip()
     options = [opt.strip() for opt in request.form.getlist("options") if opt.strip()]
     login_required = request.form.get("login_required", "none")
     cookie_mode = request.form.get("cookie_mode", "yes")
+    allow_multiple = request.form.get("allow_multiple", "no") == "yes"
+    # per-poll minimum session age in minutes; default to global if empty/invalid
+    try:
+        min_session_age = int(request.form.get("min_session_age", ""))
+    except Exception:
+        min_session_age = 0
+    if not min_session_age:
+        min_session_age = DEFAULT_MIN_SESSION_AGE_MINUTES
     loc_req_raw = request.form.get("location_required", "no")
     location_required = (loc_req_raw == "yes") and LOCATION_FEATURE_ENABLED
     if not question or len(options) < 2:
@@ -1085,6 +1123,8 @@ def create_poll():
         "options": options,
         "login_required": login_required,
         "cookie_mode": cookie_mode,
+        "allow_multiple": allow_multiple,
+        "min_session_age": int(min_session_age),
         "location_required": location_required,
         "created": datetime.now(timezone.utc).isoformat()
     }
@@ -1130,6 +1170,16 @@ def poll_vote(poll_id):
             return redirect(url_for("login_microsoft"))
         abort(403)
     choice = request.form.get("vote")
+    # Enforce minimum session age before voting
+    try:
+        started = int(session.get("session_started_at", 0))
+    except Exception:
+        started = 0
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    min_age_min = int(p.get("min_session_age") or DEFAULT_MIN_SESSION_AGE_MINUTES)
+    age_ok = (started and (now_ts - started) >= (min_age_min * 60))
+    if not age_ok:
+        return redirect(url_for("poll_results", poll_id=poll_id, error="session_age"))
     # Gov ID: enforce single vote per verified ID if present
     voter_session = session.get('voter') if GOV_ID_ENABLED else None
     if voter_session and voter_session.get('has_voted'):
@@ -1159,19 +1209,21 @@ def poll_vote(poll_id):
     ev_tag = compute_ev_tag(ip, ua)  # legacy (IP+UA)
     ip_tag = compute_ip_tag(ip)      # new (IP only)
     db = _load_db_for_poll(poll_id, options)
-    # Duplicate logic priority: account > device > location (location only if enabled and no identity match)
-    if id_tag and any(v.get("identity_tag") == id_tag for v in db["votes"].values()):
-        return redirect(url_for("poll_results", poll_id=poll_id, error="account"))
-    if not id_tag and not DISABLE_IP_UA_DEDUP:
-        # First try strict IP-only tag (new scheme)
-        if ip_tag and any(v.get("ip_tag") == ip_tag for v in db["votes"].values()):
-            return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
-        # Fallback legacy evidence_tag (IP+UA) for pre-migration votes
-        if ev_tag and any(v.get("evidence_tag") == ev_tag for v in db["votes"].values()):
-            return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
-    if loc_required and location_tag and any(v.get("location_tag") == location_tag for v in db["votes"].values()):
-        return redirect(url_for("poll_results", poll_id=poll_id, error="location"))
-    if request.cookies.get(cookie_key):
+    allow_multiple = bool(p.get("allow_multiple"))
+    # Duplicate logic priority (only when single-vote polls): account > device > location
+    if not allow_multiple:
+        if id_tag and any(v.get("identity_tag") == id_tag for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id, error="account"))
+        if not id_tag and not DISABLE_IP_UA_DEDUP:
+            # First try strict IP-only tag (new scheme)
+            if ip_tag and any(v.get("ip_tag") == ip_tag for v in db["votes"].values()):
+                return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
+            # Fallback legacy evidence_tag (IP+UA) for pre-migration votes
+            if ev_tag and any(v.get("evidence_tag") == ev_tag for v in db["votes"].values()):
+                return redirect(url_for("poll_results", poll_id=poll_id, error="device_ip"))
+        if loc_required and location_tag and any(v.get("location_tag") == location_tag for v in db["votes"].values()):
+            return redirect(url_for("poll_results", poll_id=poll_id, error="location"))
+    if not allow_multiple and request.cookies.get(cookie_key):
         return redirect(url_for("poll_results", poll_id=poll_id, error="device_cookie"))
     ts = datetime.now(timezone.utc).isoformat()
     # Privacy: do not collect/store raw IP/UA; store only HMAC tags in DB
@@ -1236,8 +1288,11 @@ def poll_vote(poll_id):
         voter_session['has_voted'] = True
         session['voter'] = voter_session
     resp = make_response(redirect(url_for("poll_receipt", poll_id=poll_id, h=(eh or ""), i=idx)))
-    secure = os.getenv("PRODUCTION","").lower() in ("1","true")
-    resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
+    # Only set device cookie if poll is single-vote mode and cookie_mode=yes
+    if not allow_multiple and (p.get("cookie_mode", "yes") == "yes"):
+        secure = os.getenv("PRODUCTION","").lower() in ("1","true") or SESSION_SECURE
+        # Use configured SameSite for third-party support
+        resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite=COOKIE_SAMESITE, secure=secure, httponly=True)
     return resp
 
 @app.route("/poll/<poll_id>/results")
@@ -1267,6 +1322,18 @@ def poll_results(poll_id):
             err_msg = "This account has already voted."
         elif err_code == "location":
             err_msg = "A vote from this location was already recorded."
+        elif err_code == "session_age":
+            # show remaining time roughly
+            try:
+                started = int(session.get("session_started_at", 0))
+            except Exception:
+                started = 0
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            min_age_min = int(p.get("min_session_age") or DEFAULT_MIN_SESSION_AGE_MINUTES)
+            waited = max(0, now_ts - started)
+            remain = max(0, (min_age_min*60) - waited)
+            mins = max(1, int((remain+59)//60))
+            err_msg = f"You need to keep this session open a bit longer before voting (about {mins} minute(s) remaining)."
         return render_template(
             "result.html",
             question=p.get("question"),
@@ -1372,7 +1439,9 @@ def index():
                           user=user, 
                           question=POLL_QUESTION, 
                           options=POLL_OPTIONS,
-                          voted=voted)
+                          voted=voted,
+                          DEFAULT_MIN_SESSION_AGE_MINUTES=DEFAULT_MIN_SESSION_AGE_MINUTES,
+                          COOKIE_SAMESITE=COOKIE_SAMESITE)
 
 @app.route("/vote", methods=["POST"])
 def vote():
@@ -1380,6 +1449,16 @@ def vote():
     voter_session = session.get('voter') if GOV_ID_ENABLED else None
     if voter_session and voter_session.get('has_voted'):
         return redirect(url_for('results', error='account'))
+    # Enforce global poll minimum session age (use default)
+    try:
+        started = int(session.get("session_started_at", 0))
+    except Exception:
+        started = 0
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    min_age_min = int(DEFAULT_MIN_SESSION_AGE_MINUTES)
+    age_ok = (started and (now_ts - started) >= (min_age_min * 60))
+    if not age_ok:
+        return redirect(url_for("results", error="session_age"))
     if choice not in POLL_OPTIONS:
         return "Invalid vote option!", 400
     cookie_key = f"voted_{POLL_ID}"
@@ -1399,6 +1478,7 @@ def vote():
             return redirect(url_for("results", error="device_ip"))
         if ev_tag and any(v.get("evidence_tag") == ev_tag for v in votes_db["votes"].values()):
             return redirect(url_for("results", error="device_ip"))
+    # For global poll, respect cookie_mode env by reusing existing behavior (single-vote)
     if request.cookies.get(cookie_key):
         return redirect(url_for("results", error="device_cookie"))
     ts = datetime.now(timezone.utc).isoformat()
@@ -1450,8 +1530,8 @@ def vote():
         voter_session['has_voted'] = True
         session['voter'] = voter_session
     resp = make_response(redirect(url_for("receipt", h=eh or "", i=idx)))
-    secure = os.getenv("PRODUCTION","").lower() in ("1","true")
-    resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite="Lax", secure=secure, httponly=True)
+    secure = os.getenv("PRODUCTION","").lower() in ("1","true") or SESSION_SECURE
+    resp.set_cookie(cookie_key, "1", max_age=30*24*3600, samesite=COOKIE_SAMESITE, secure=secure, httponly=True)
     return resp
 
 @app.route("/results")
@@ -1479,6 +1559,17 @@ def results():
             err_msg = "This account has already voted."
         elif err_code == "location":
             err_msg = "A vote from this location was already recorded."
+        elif err_code == "session_age":
+            try:
+                started = int(session.get("session_started_at", 0))
+            except Exception:
+                started = 0
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            min_age_min = int(DEFAULT_MIN_SESSION_AGE_MINUTES)
+            waited = max(0, now_ts - started)
+            remain = max(0, (min_age_min*60) - waited)
+            mins = max(1, int((remain+59)//60))
+            err_msg = f"You need to keep this session open a bit longer before voting (about {mins} minute(s) remaining)."
         return render_template(
             "result.html",
             question=POLL_QUESTION,

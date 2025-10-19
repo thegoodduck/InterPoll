@@ -3,16 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <title>Create Poll</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
     <style>
-        body { font-family: Arial, sans-serif; background: #f7f7fa; }
-        .container { max-width: 600px; margin: 40px auto; background: rgba(255,255,255,0.8); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); padding: 32px; }
+        body { background: var(--bg); }
+        .container { max-width: 680px; margin: 40px auto; background: var(--card); border:1px solid var(--line); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.06); padding: 32px; }
         h2 { text-align: center; }
         label { display: block; margin-top: 16px; font-weight: bold; }
-        input, select, textarea { width: 100%; padding: 8px; margin-top: 8px; border-radius: 8px; border: 1px solid #ccc; }
+        input, select, textarea { width: 100%; padding: 8px; margin-top: 8px; border-radius: 8px; border: 1px solid var(--line); }
         .options-list { margin-top: 8px; }
         .option-input { display: flex; gap: 8px; margin-bottom: 8px; }
-        button { margin-top: 24px; padding: 12px 24px; border: none; border-radius: 8px; background: #4f8cff; color: #fff; font-size: 1.1em; cursor: pointer; }
-        button:hover { background: #357ae8; }
+        button { margin-top: 24px; padding: 12px 24px; border: 1px solid var(--brand); border-radius: 10px; background: var(--brand); color: #fff; font-size: 1.05em; cursor: pointer; }
     </style>
     <script>
     function addOption() {
@@ -65,6 +65,15 @@
                 <option value="yes">Yes</option>
                 <option value="no">No</option>
             </select>
+
+            <label for="allow_multiple">Allow Multiple Votes (disables device cookie dedup)</label>
+            <select id="allow_multiple" name="allow_multiple">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+            </select>
+
+            <label for="min_session_age">Minimum Session Age (minutes, default {{ DEFAULT_MIN_SESSION_AGE_MINUTES }})</label>
+            <input type="number" id="min_session_age" name="min_session_age" min="0" placeholder="e.g., 60" />
 
             <label for="location_required">Require Approximate Location (HMAC-hashed, ~11m rounding)
                 {% if not LOCATION_FEATURE_ENABLED %}
