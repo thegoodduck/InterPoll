@@ -108,9 +108,11 @@
                 if (status) { status.textContent = body.verified ? 'Receipt stored & VERIFIED on Receipter.' : 'Receipt stored (not yet verified).'; status.style.color = body.verified ? '#059669' : '#d97706'; }
             } catch (e) {
                 if (status) { status.textContent = 'Auto send failed: ' + e.message + ' (You can manually download & upload later)'; status.style.color = '#dc2626'; }
+                window.__receipterOk = true;
             }
         }
 
+                window.__receipterOk = false;
         async function openReceipterWithHash(){
             const page = '{{ receipter_page_url }}';
             if (!page) { 
@@ -134,7 +136,21 @@
             const btnOpen = document.getElementById('btnOpenReceipter');
             const autoWrap = document.getElementById('autoSendWrap');
             if (!hasReceipter) {
-                if (btnSend) btnSend.style.display = 'none';
+                const triggerAuto = document.getElementById('autoSendToggle')?.checked || enforce;
+                if (triggerAuto) sendToReceipter();
+                if (enforce) {
+                    const links = document.querySelectorAll('a.require-ok');
+                    links.forEach(a => {
+                        a.addEventListener('click', (e) => {
+                            if (!window.__receipterOk) {
+                                e.preventDefault();
+                                const s = document.getElementById('receipterStatus');
+                                if (s) { s.textContent = 'Please wait — pushing receipt to Receipter…'; s.style.color = '#b45309'; }
+                                sendToReceipter();
+                            }
+                        });
+                    });
+                }
                 if (autoWrap) { autoWrap.style.display = 'none'; const t = document.getElementById('autoSendToggle'); if (t) t.checked=false; }
                 const status = document.getElementById('receipterStatus');
                 if (status) { status.textContent = 'Receipter integration disabled.'; status.style.color = '#6b7280'; }
@@ -190,8 +206,8 @@
         </ol>
 
         <p>
-            <a href="{{ results_url or url_for('results') }}">See results</a> ·
-            <a href="{{ back_url or url_for('index') }}">Back to poll</a> ·
+              <a class="require-ok" href="{{ results_url or url_for('results') }}">See results</a> ·
+              <a class="require-ok" href="{{ back_url or url_for('index') }}">Back to poll</a> ·
             <a href="{{ receipter_page_url }}" target="_blank">Open Receipter</a>
         </p>
     </div>

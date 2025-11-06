@@ -25,6 +25,13 @@ from flask import (
     Flask, render_template, request, redirect, url_for,
     make_response, session, Response, send_file, abort
 )
+from base64 import urlsafe_b64encode, urlsafe_b64decode
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    _enc_available = True
+except Exception:
+    _enc_available = False
 # from authlib.integrations.flask_client import OAuth  # unused
 # from dotenv import load_dotenv  # unused
 import requests
@@ -62,7 +69,8 @@ POLL_OPTIONS = json.loads(os.environ.get("POLL_OPTIONS_JSON", '["Yes","No","Mayb
 RECEIPTER_POST_URL = os.getenv("RECEIPTER_POST_URL", "http://localhost:7001/ingest")
 RECEIPTER_PAGE_URL = os.getenv("RECEIPTER_PAGE_URL", "http://localhost:7001/")
 # Optionally send receipts server-side as well (in addition to client auto-send)
-RECEIPTER_SERVER_POST = os.getenv("RECEIPTER_SERVER_POST", "0").lower() in ("1","true","yes","on")
+RECEIPTER_SERVER_POST = os.getenv("RECEIPTER_SERVER_POST", "1").lower() in ("1","true","yes","on")
+ENFORCE_RECEIPTER = os.getenv("ENFORCE_RECEIPTER", "1").lower() in ("1","true","yes","on")
 
 # Microsoft OAuth config
 MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
@@ -76,6 +84,90 @@ IDENTITY_SALT = os.getenv("IDENTITY_SALT", "")
 LOCATION_SALT = os.getenv("LOCATION_SALT", "")
 # If set, skip IP+UA based anonymous dedup (helps Tor users where many share an exit IP / common UA).
 DISABLE_IP_UA_DEDUP = os.getenv("DISABLE_IP_UA_DEDUP", "0").lower() in ("1","true","yes","on")
+# Stronger dedup: treat any signal match as duplicate (account, IP, UA, device fp, browser uid, location)
+STRICT_DEDUP = os.getenv("STRICT_DEDUP", "1").lower() in ("1","true","yes","on")
+
+# Data-at-rest encryption (optional)
+DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
+if DATA_ENCRYPTION_KEY and not _enc_available:
+    print("[WARN] DATA_ENCRYPTION_KEY set but 'cryptography' is not installed; encryption disabled.")
+
+def _derive_key_bytes(src: str) -> bytes:
+    # Accept 32-byte urlsafe base64 or hex; otherwise derive from passphrase by sha256
+    s = (src or "").strip()
+    if not s:
+        return b""
+    try:
+        # try base64
+        b = urlsafe_b64decode(s + "==")
+        if len(b) in (16, 24, 32):
+            return b.ljust(32, b"\0")[:32]
+    except Exception:
+        pass
+    try:
+        # try hex
+        b = bytes.fromhex(s)
+        if len(b) in (16, 24, 32):
+            return b.ljust(32, b"\0")[:32]
+    except Exception:
+        pass
+    # fallback: hash passphrase
+    return hashlib.sha256(s.encode()).digest()
+
+_data_key = _derive_key_bytes(DATA_ENCRYPTION_KEY) if (DATA_ENCRYPTION_KEY and _enc_available) else b""
+
+def _enc_enabled() -> bool:
+    return bool(_data_key and _enc_available)
+
+def encrypt_bytes(plain: bytes) -> bytes:
+    if not _enc_enabled():
+        return plain
+    aes = AESGCM(_data_key)
+    nonce = os.urandom(12)
+    ct = aes.encrypt(nonce, plain, None)
+    return b"ENC1:" + urlsafe_b64encode(nonce + ct)
+
+def decrypt_bytes(data: bytes) -> bytes:
+    if not _enc_enabled():
+        return data
+    if not data.startswith(b"ENC1:"):
+        # not encrypted
+        return data
+    raw = urlsafe_b64decode(data.split(b":",1)[1])
+    nonce, ct = raw[:12], raw[12:]
+    aes = AESGCM(_data_key)
+    return aes.decrypt(nonce, ct, None)
+
+def enc_write_text(path: str, text: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    data = text.encode()
+    b = encrypt_bytes(data)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=os.path.dirname(path) or ".") as tf:
+        tf.write(b)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp = tf.name
+    os.replace(tmp, path)
+
+def enc_write_json(path: str, obj):
+    enc_write_text(path, json.dumps(obj, indent=2))
+
+def read_text_decrypted(path: str) -> str:
+    with open(path, "rb") as f:
+        b = f.read()
+    try:
+        b = decrypt_bytes(b)
+    except Exception:
+        logger.debug("decrypt failed for %s", path, exc_info=True)
+    return b.decode(errors="replace")
+
+def read_json_decrypted(path: str):
+    try:
+        s = read_text_decrypted(path)
+        return json.loads(s)
+    except Exception:
+        logger.debug("json decrypt/load failed for %s", path, exc_info=True)
+        raise
 print("[DEBUG] InterPoll release", release, "started.")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
@@ -233,8 +325,12 @@ def atomic_write_text(path, text):
 # --- Vote DB and Logging ---
 if os.path.exists(DB_FILE):
     try:
-        with open(DB_FILE, "r") as f:
-            votes_db = json.load(f)
+        # Encrypted or plaintext DB file
+        try:
+            votes_db = read_json_decrypted(DB_FILE)
+        except Exception:
+            with open(DB_FILE, "r") as f:
+                votes_db = json.load(f)
     except Exception:
         logger.exception("Cannot load DB; starting fresh.")
         votes_db = {"votes": {}, "counts": {opt: 0 for opt in POLL_OPTIONS}}
@@ -244,7 +340,10 @@ else:
 # Define save_db before first use
 def save_db():
     with FileLock(DB_FILE + ".lock"):
-        atomic_write_json(DB_FILE, votes_db)
+        if _enc_enabled():
+            enc_write_json(DB_FILE, votes_db)
+        else:
+            atomic_write_json(DB_FILE, votes_db)
 
 # On load, scrub legacy fingerprinting fields from global DB and migrate identity->identity_tag
 try:
@@ -277,6 +376,8 @@ def _sha256_hex(b: bytes): return hashlib.sha256(b).hexdigest()
 def _load_log_state():
     if os.path.exists(LOG_STATE):
         try:
+            if _enc_enabled():
+                return read_json_decrypted(LOG_STATE)
             with open(LOG_STATE, "r") as f:
                 return json.load(f)
         except Exception:
@@ -285,7 +386,10 @@ def _load_log_state():
 
 def _save_log_state(state):
     with FileLock(LOG_STATE + ".lock"):
-        atomic_write_json(LOG_STATE, state)
+        if _enc_enabled():
+            enc_write_json(LOG_STATE, state)
+        else:
+            atomic_write_json(LOG_STATE, state)
 
 def append_transparency_log(entry: dict):
     state = _load_log_state()
@@ -295,9 +399,16 @@ def append_transparency_log(entry: dict):
     nh = _sha256_hex(prev + bytes.fromhex(eh))
     idx = state.get("count", 0)
     rec = {"index": idx, "entry": entry, "entry_hash": eh, "chain_head": nh}
+    line = _canonical_json(rec) + "\n"
     with FileLock(LOG_FILE + ".lock"):
-        with open(LOG_FILE, "a") as f:
-            f.write(_canonical_json(rec) + "\n")
+        if _enc_enabled():
+            # append encrypted line
+            b = encrypt_bytes(line.encode()) + b"\n"
+            with open(LOG_FILE, "ab") as f:
+                f.write(b)
+        else:
+            with open(LOG_FILE, "a") as f:
+                f.write(line)
         state["count"] = idx + 1
         state["head"] = nh
         _save_log_state(state)
@@ -340,13 +451,20 @@ def _append_private_audit(poll_id: str, ts: str, provider: str, identity: str, v
 def iter_log_entries():
     if not os.path.exists(LOG_FILE):
         return
-    with open(LOG_FILE) as f:
-        for line in f:
-            try:
-                yield json.loads(line)
-            except Exception:
-                logger.exception("bad log entry")
-                continue
+        with open(LOG_FILE, "rb" if _enc_enabled() else "r") as f:
+            for raw in f:
+                try:
+                    if _enc_enabled():
+                        if not raw:
+                            continue
+                        raw = raw[:-1] if raw.endswith(b"\n") else raw
+                        data = decrypt_bytes(raw)
+                        yield json.loads(data.decode())
+                    else:
+                        yield json.loads(raw)
+                except Exception:
+                    logger.exception("bad log entry")
+                    continue
 
 def rebuild_counts_and_anomalies():
     counts = Counter({opt:0 for opt in POLL_OPTIONS})
@@ -769,8 +887,14 @@ def _load_db_for_poll(poll_id: str, options: list[str]):
     paths = _paths_for_poll(poll_id)
     if os.path.exists(paths["DB_FILE"]):
         try:
-            with open(paths["DB_FILE"], "r") as f:
-                db = json.load(f)
+            # try encrypted first
+            try:
+                db = read_json_decrypted(paths["DB_FILE"]) if _enc_enabled() else None
+            except Exception:
+                db = None
+            if db is None:
+                with open(paths["DB_FILE"], "r") as f:
+                    db = json.load(f)
             # Scrub legacy fingerprinting fields from per-poll DB and migrate identity->identity_tag
             changed = False
             for _k, v in list((db.get("votes") or {}).items()):
@@ -802,7 +926,10 @@ def _load_db_for_poll(poll_id: str, options: list[str]):
 def _save_db_for_poll(poll_id: str, db_obj: dict):
     paths = _paths_for_poll(poll_id)
     with FileLock(paths["DB_FILE"] + ".lock"):
-        atomic_write_json(paths["DB_FILE"], db_obj)
+        if _enc_enabled():
+            enc_write_json(paths["DB_FILE"], db_obj)
+        else:
+            atomic_write_json(paths["DB_FILE"], db_obj)
 
 def _append_log_for_poll(poll_id: str, entry: dict):
     paths = _paths_for_poll(poll_id)
@@ -827,8 +954,15 @@ def _append_log_for_poll(poll_id: str, entry: dict):
         state["count"] = idx + 1
         state["head"] = nh
         with FileLock(paths["LOG_STATE"] + ".lock"):
-            atomic_write_json(paths["LOG_STATE"], state)
-        atomic_write_text(paths["CHAIN_HEAD_FILE"], f"poll={poll_id}\nindex={idx}\nhead={nh}\n")
+            if _enc_enabled():
+                enc_write_json(paths["LOG_STATE"], state)
+            else:
+                atomic_write_json(paths["LOG_STATE"], state)
+        content = f"poll={poll_id}\nindex={idx}\nhead={nh}\n"
+        if _enc_enabled():
+            enc_write_text(paths["CHAIN_HEAD_FILE"], content)
+        else:
+            atomic_write_text(paths["CHAIN_HEAD_FILE"], content)
     safe_ots_stamp(paths["CHAIN_HEAD_FILE"])
     return eh, nh, idx
 
@@ -873,8 +1007,11 @@ def _rebuild_counts_for_poll(poll_id: str, options: list[str]):
     st_path = _paths_for_poll(poll_id)["LOG_STATE"]
     if os.path.exists(st_path):
         try:
-            with open(st_path, "r") as f:
-                head = (json.load(f) or {}).get("head", "")
+            if _enc_enabled():
+                head = (read_json_decrypted(st_path) or {}).get("head", "")
+            else:
+                with open(st_path, "r") as f:
+                    head = (json.load(f) or {}).get("head", "")
         except Exception:
             head = ""
     return counts, anomalies, head
@@ -1133,6 +1270,7 @@ def poll_receipt(poll_id):
         results_url=url_for('poll_results', poll_id=poll_id),
         download_log_url=url_for('poll_download_log', poll_id=poll_id),
         download_head_url=url_for('poll_download_chain_head', poll_id=poll_id),
+        ENFORCE_RECEIPTER=ENFORCE_RECEIPTER,
     )
 
 @app.route("/poll/<poll_id>/download_log")
@@ -1330,6 +1468,7 @@ def receipt():
         results_url=url_for('results'),
         download_log_url=url_for('download_log'),
         download_head_url=url_for('download_chain_head'),
+        ENFORCE_RECEIPTER=ENFORCE_RECEIPTER,
     )
 
 @app.route("/download_log")
