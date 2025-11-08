@@ -1128,7 +1128,8 @@ def poll_vote(poll_id):
     os.makedirs(vote_dir, exist_ok=True)
     fn = os.path.join(vote_dir, f"{file_hash}.txt")
     try:
-        atomic_write_text(fn, vote_data)
+        # Encrypt vote content at rest when a data key is configured
+        enc_write_text(fn, vote_data)
     except Exception:
         logger.exception("Vote file error")
         return "Error saving vote", 500
@@ -1348,7 +1349,8 @@ def vote():
     os.makedirs(VOTE_DIR, exist_ok=True)
     fn = os.path.join(VOTE_DIR, f"{file_hash}.txt")
     try:
-        atomic_write_text(fn, vote_data)
+        # Encrypt vote content at rest when a data key is configured
+        enc_write_text(fn, vote_data)
     except Exception:
         logger.exception("Vote file error")
         return "Error saving vote", 500
@@ -1615,9 +1617,15 @@ def verify_receipt():
         vote_path = os.path.join(VOTE_DIR, f"{file_id}.txt")
         if os.path.exists(vote_path):
             try:
+                # Read and decrypt (if needed) before hashing for verification
                 with open(vote_path, "rb") as vf:
-                    data = vf.read()
-                calc = hashlib.sha256(data).hexdigest()
+                    raw = vf.read()
+                try:
+                    plain = decrypt_bytes(raw)
+                except Exception:
+                    # If decrypt fails, treat file as plaintext
+                    plain = raw
+                calc = hashlib.sha256(plain).hexdigest()
                 file_ok = (calc == file_id)
             except Exception:
                 file_ok = False
